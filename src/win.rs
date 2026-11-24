@@ -428,6 +428,7 @@ unsafe extern "system" {
     pub fn DispatchMessageW(message: *const Msg) -> isize;
     fn SendMessageW(window: Handle, message: u32, wp: usize, lp: isize) -> isize;
     fn ShowWindow(window: Handle, show: i32) -> i32;
+    fn SystemParametersInfoW(action: u32, parameter: u32, output: *mut c_void, flags: u32) -> i32;
     pub fn IsWindowVisible(window: Handle) -> i32;
     fn GetClientRect(window: Handle, rect: *mut Rect) -> i32;
     fn SetWindowTextW(window: Handle, value: *const u16) -> i32;
@@ -450,7 +451,6 @@ unsafe extern "system" {
     fn SetCursor(cursor: Handle) -> Handle;
     fn TrackMouseEvent(track: *const TrackMouse) -> i32;
     fn MapWindowPoints(from: Handle, to: Handle, points: *mut Point, count: u32) -> i32;
-    fn GetCursorPos(point: *mut Point) -> i32;
     fn BeginPaint(window: Handle, paint: *mut PaintStruct) -> Handle;
     fn EndPaint(window: Handle, paint: *const PaintStruct) -> i32;
     fn GetScrollInfo(window: Handle, axis: i32, info: *mut ScrollInfo) -> i32;
@@ -794,11 +794,6 @@ pub fn map_point(from: Handle, to: Handle, mut point: Point) -> Point {
     point
 }
 
-pub fn pointer_over(window: Handle) -> bool {
-    let mut point = Point::default();
-    (unsafe { GetCursorPos(&mut point) }) != 0 && bounds(window).has(map_point(0, window, point))
-}
-
 pub fn relative_rect(window: Handle, parent: Handle) -> Rect {
     let mut rect = Rect::default();
     unsafe {
@@ -814,6 +809,12 @@ pub fn clip_client(window: Handle, rect: Rect) {
         if region != 0 && SetWindowRgn(window, region, 1) == 0 {
             DeleteObject(region);
         }
+    }
+}
+
+pub fn clear_clip(window: Handle) {
+    unsafe {
+        SetWindowRgn(window, 0, 1);
     }
 }
 
@@ -968,6 +969,14 @@ pub fn repaint_rect(window: Handle, rect: Rect) {
     unsafe {
         InvalidateRect(window, &rect, 0);
     }
+}
+
+pub fn client_animations() -> bool {
+    let mut enabled = 1;
+    unsafe {
+        SystemParametersInfoW(0x1042, 0, (&mut enabled as *mut i32).cast(), 0);
+    }
+    enabled != 0
 }
 
 pub fn editor_character_at(window: Handle, point: Point) -> i32 {

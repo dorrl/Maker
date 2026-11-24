@@ -1,4 +1,5 @@
 use super::*;
+use motion::{Area, Effect, Key};
 
 pub(super) const SURFACE: &str = "MakerSurface";
 pub(super) const DIVIDER: usize = 310;
@@ -11,6 +12,7 @@ const TREE_ARROW: isize = 0x10;
 
 thread_local! {
     static HOVERED_BUTTON: Cell<Handle> = const { Cell::new(0) };
+    static PRESSED_BUTTON: Cell<Handle> = const { Cell::new(0) };
     static MODIFIED_LIST_CLICK: Cell<bool> = const { Cell::new(false) };
     static HOVERED_ROW: Cell<Option<(Handle, usize)>> = const { Cell::new(None) };
 }
@@ -20,9 +22,14 @@ fn hover_row(window: Handle, next: Option<usize>) {
     let old = HOVERED_ROW.replace(next);
     if old != next {
         for (list, row) in old.into_iter().chain(next) {
-            if let Some(rect) = list_item_rect(list, row) {
-                repaint_rect(list, rect);
-            }
+            let entering = next == Some((list, row));
+            motion::animate(
+                unsafe { GetParent(list) },
+                Key::item(list, row, Effect::Hover),
+                Area::Item,
+                !entering,
+                entering,
+            );
         }
     }
 }
@@ -31,6 +38,56 @@ pub(super) fn clear_file_hover(window: Handle) {
     if HOVERED_ROW.get().is_some_and(|(list, _)| list == window) {
         hover_row(window, None);
     }
+}
+
+pub(super) fn reset_file_motion(window: Handle) {
+    clear_file_hover(window);
+    motion::clear(window);
+}
+
+fn visible_selection(list: Handle) -> Vec<(usize, bool)> {
+    let first = send(list, LB_GETTOPINDEX, 0, 0).max(0) as usize;
+    let total = send(list, 0x018b, 0, 0).max(0) as usize;
+    let row_height = send(list, 0x01a1, 0, 0).max(1) as i32;
+    let visible = (bounds(list).height().max(0) / row_height + 1) as usize;
+    (first..(first + visible).min(total))
+        .map(|row| (row, send(list, 0x0187, row, 0) > 0))
+        .collect()
+}
+
+fn transition_selection(list: Handle, parent: Handle, before: Vec<(usize, bool)>) {
+    for (row, old) in before {
+        let selected = send(list, 0x0187, row, 0) > 0;
+        if old != selected {
+            motion::animate(
+                parent,
+                Key::item(list, row, Effect::Selected),
+                Area::Item,
+                old,
+                selected,
+            );
+        }
+    }
+}
+
+pub(super) fn select_file_row(list: Handle, row: usize) {
+    let previous = if motion::enabled() {
+        visible_selection(list)
+    } else {
+        Vec::new()
+    };
+    list_select(list, row);
+    transition_selection(list, unsafe { GetParent(list) }, previous);
+}
+
+pub(super) fn animate_folder(list: Handle, row: usize, open: bool) {
+    motion::animate(
+        unsafe { GetParent(list) },
+        Key::item(list, row, Effect::Arrow),
+        Area::Item,
+        !open,
+        open,
+    );
 }
 
 #[derive(Clone, Copy, Default)]
@@ -74,6 +131,8 @@ pub(super) struct Chrome {
     scroll_hover: Option<usize>,
     drag: Option<Drag>,
     pub(super) menu: Option<Menu>,
+    closing_menu: Option<Menu>,
+    closing_editor_tools: bool,
     popup_bounds: Cell<Option<Rect>>,
     bars: [ScrollBar; 6],
     scroll_clips: [(Handle, Rect); 4],
@@ -101,9 +160,20 @@ impl Chrome {
             scroll_hover: None,
             drag: None,
             menu: None,
+            closing_menu: None,
+            closing_editor_tools: false,
             popup_bounds: Cell::new(None),
             scroll_clips: [(0, Rect::default()); 4],
         })
+    }
+
+    fn scroll_lit(&self, id: usize) -> bool {
+        self.scroll_hover == Some(id)
+            || matches!(self.drag, Some(Drag::Scroll { id: held, .. }) if held == id)
+    }
+
+    fn divider_lit(&self) -> bool {
+        self.divider_hover || matches!(self.drag, Some(Drag::Sidebar { .. }))
     }
 }
 
@@ -127,6 +197,9 @@ extern "system" fn surface_proc(window: Handle, message: u32, wp: usize, lp: isi
             return 0;
         }
         WM_ERASEBKGND => return 1,
+        0x0084 if id == POPUP && with_app(|app| app.chrome.menu.is_none()).unwrap_or(false) => {
+            return -1; // HTTRANSPARENT while a dismissed menu finishes its transition.
+        }
         WM_SETCURSOR if id == DIVIDER => {
             cursor(32644);
             return 1;
@@ -166,18 +239,8 @@ extern "system" fn control_proc(
     toolbar: usize,
 ) -> isize {
     let parent = unsafe { GetParent(window) };
-    if toolbar != 0 && message == WM_MOUSEMOVE {
-        // Only the first move in a hover needs to invalidate an owner-drawn button.
-        if HOVERED_BUTTON.replace(window) != window {
-            watch_mouse(window);
-            repaint(window);
-        }
-    }
-    if toolbar != 0 && message == WM_MOUSELEAVE {
-        if HOVERED_BUTTON.get() == window {
-            HOVERED_BUTTON.set(0);
-        }
-        repaint(window);
+    if toolbar != 0 {
+        button_input(parent, window, message, wp);
     }
     let list = toolbar == 0 && unsafe { GetDlgCtrlID(window) } == LIST as i32;
     let row_list =
@@ -188,9 +251,20 @@ extern "system" fn control_proc(
         }
         hover_row(window, list_at(window, lp));
     }
-    if row_list && matches!(message, WM_MOUSELEAVE | WM_MOUSEWHEEL) {
+    if row_list && message == WM_MOUSELEAVE {
         clear_file_hover(window);
     }
+    if row_list && matches!(message, WM_MOUSEWHEEL | WM_VSCROLL) {
+        reset_file_motion(window);
+    }
+    let previous = if row_list
+        && motion::enabled()
+        && matches!(message, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_KEYDOWN)
+    {
+        visible_selection(window)
+    } else {
+        Vec::new()
+    };
     if list && matches!(message, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK) {
         let modifiers = wp & 0x0c;
         MODIFIED_LIST_CLICK.set(modifiers != 0);
@@ -200,6 +274,7 @@ extern "system" fn control_proc(
                     SetFocus(window);
                 }
                 list_modified_click(window, row, modifiers & 4 != 0, modifiers & 8 != 0);
+                transition_selection(window, parent, previous);
                 unsafe {
                     PostMessageW(parent, EXPLORER_CLICK, row, modifiers as isize);
                 }
@@ -211,6 +286,7 @@ extern "system" fn control_proc(
         return 0;
     }
     let result = unsafe { DefSubclassProc(window, message, wp, lp) };
+    transition_selection(window, parent, previous);
     if list
         && message == WM_LBUTTONUP
         && let Some(item) = list_at(window, lp)
@@ -262,7 +338,7 @@ pub(super) fn handle_parent_message(message: u32, wp: usize, modifiers: isize) -
                     && wp < app.list_items.len()
                     && modifiers & 0x0c == 0
                 {
-                    list_select(app.list, wp);
+                    select_file_row(app.list, wp);
                     app.track_explorer_selection();
                     let opened = match app.list_items.get(wp) {
                         Some(ListItem::Archive { path, .. }) if modifiers == TREE_ARROW => {
@@ -285,6 +361,84 @@ pub(super) fn handle_parent_message(message: u32, wp: usize, modifiers: isize) -
         _ => return false,
     }
     true
+}
+
+fn button_input(parent: Handle, window: Handle, message: u32, wp: usize) {
+    let control = |effect, from, to| {
+        motion::animate(
+            parent,
+            Key::control(window, effect),
+            Area::Control,
+            from,
+            to,
+        );
+    };
+    match message {
+        WM_MOUSEMOVE => {
+            let previous = HOVERED_BUTTON.replace(window);
+            if previous != window {
+                watch_mouse(window);
+                if previous != 0 {
+                    motion::animate(
+                        parent,
+                        Key::control(previous, Effect::Hover),
+                        Area::Control,
+                        true,
+                        false,
+                    );
+                }
+                control(Effect::Hover, false, true);
+            }
+        }
+        WM_MOUSELEAVE if HOVERED_BUTTON.get() == window => {
+            HOVERED_BUTTON.set(0);
+            control(Effect::Hover, true, false);
+        }
+        0x0007 => control(Effect::Focus, false, true),
+        0x0008 => {
+            control(Effect::Focus, true, false);
+            if PRESSED_BUTTON.get() == window {
+                PRESSED_BUTTON.set(0);
+                control(Effect::Press, true, false);
+            }
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | 0x00f5 => {
+            PRESSED_BUTTON.set(window);
+            control(Effect::Press, false, true);
+        }
+        WM_KEYDOWN if matches!(wp, 13 | 32) && PRESSED_BUTTON.get() != window => {
+            PRESSED_BUTTON.set(window);
+            control(Effect::Press, false, true);
+        }
+        WM_CAPTURECHANGED | WM_LBUTTONUP | 0x0101 if PRESSED_BUTTON.get() == window => {
+            PRESSED_BUTTON.set(0);
+            control(Effect::Press, true, false);
+        }
+        _ => {}
+    }
+}
+
+pub(super) fn button_tint(item: &DrawItem, palette: Paint, base: u32, active: bool) -> u32 {
+    let level = |effect, steady| motion::value(Key::control(item.window, effect), steady);
+    let hover = level(Effect::Hover, HOVERED_BUTTON.get() == item.window);
+    let focus = level(Effect::Focus, item.state & 0x10 != 0);
+    let pressed = level(Effect::Press, item.state & 1 != 0);
+    let selection = level(Effect::Selected, active);
+    let highlight = selection.max(hover * 0.85).max(focus * 0.7);
+    let color = motion::mix(base, palette.selected_rgb, highlight);
+    motion::mix(color, palette.accent, pressed * 0.24)
+}
+
+pub(super) fn file_row_tint(item: &DrawItem, palette: Paint) -> u32 {
+    let index = item.item as usize;
+    let key = |effect| Key::item(item.window, index, effect);
+    let hover = motion::value(
+        key(Effect::Hover),
+        HOVERED_ROW.get() == Some((item.window, index)),
+    );
+    let selected = motion::value(key(Effect::Selected), item.state & 1 != 0);
+    let color = motion::mix(palette.panel_rgb, palette.control_rgb, hover * 0.67);
+    motion::mix(color, palette.selected_rgb, selected)
 }
 
 struct Thumb {
@@ -454,7 +608,7 @@ impl App {
             );
         }
         if bar.explorer {
-            clear_file_hover(bar.target);
+            reset_file_motion(bar.target);
         }
         self.redraw_scroll_position(bar.target);
     }
@@ -463,18 +617,20 @@ impl App {
         match id {
             TABS => self.paint_tabs(dc, rect, palette),
             DIVIDER => {
-                let lit = self.chrome.divider_hover
-                    || matches!(self.chrome.drag, Some(Drag::Sidebar { .. }));
+                let emphasis = motion::value(
+                    Key::control(self.chrome.divider, Effect::Hover),
+                    self.chrome.divider_lit(),
+                );
                 fill(dc, rect, palette.panel);
-                let thickness = self.px(if lit { 2 } else { 1 });
-                fill(
+                let thickness = if emphasis > 0.55 {
+                    self.px(2)
+                } else {
+                    self.px(1)
+                };
+                fill_color(
                     dc,
                     Rect::from_size((rect.width() - thickness) / 2, 0, thickness, rect.height()),
-                    if lit {
-                        palette.accent_brush
-                    } else {
-                        palette.border
-                    },
+                    motion::mix(palette.border_rgb, palette.accent, emphasis),
                 );
             }
             POPUP => self.paint_menu(dc, rect, palette),
@@ -502,16 +658,14 @@ impl App {
                     } else {
                         Rect::from_size(inset, thumb.start, rect.width() - 2 * inset, thumb.length)
                     };
-                    let lit = self.chrome.scroll_hover == Some(id)
-                        || matches!(self.chrome.drag, Some(Drag::Scroll { id: held, .. }) if held == id);
-                    fill(
+                    let emphasis = motion::value(
+                        Key::control(bar.handle, Effect::Hover),
+                        self.chrome.scroll_lit(id),
+                    );
+                    fill_color(
                         dc,
                         thumb_rect,
-                        if lit {
-                            palette.thumb_hover
-                        } else {
-                            palette.thumb
-                        },
+                        motion::mix(palette.thumb_rgb, palette.thumb_hover_rgb, emphasis),
                     );
                 }
             }
@@ -528,6 +682,7 @@ impl App {
             TABS => self.tabs_mouse(message, wp, point),
             POPUP => self.menu_mouse(message, wp, point),
             FIRST_SCROLL..=LAST_SCROLL => {
+                let old = self.chrome.scroll_lit(id);
                 let bar = self.chrome.bars[id - FIRST_SCROLL];
                 let coord = if bar.horizontal { point.x } else { point.y };
                 match message {
@@ -571,7 +726,16 @@ impl App {
                     }
                     _ => {}
                 }
-                redraw(window);
+                let next = self.chrome.scroll_lit(id);
+                if old != next {
+                    motion::animate(
+                        self.window,
+                        Key::control(window, Effect::Hover),
+                        Area::Control,
+                        old,
+                        next,
+                    );
+                }
             }
             _ => {}
         }
@@ -587,6 +751,7 @@ impl App {
     }
 
     fn sidebar_mouse(&mut self, window: Handle, message: u32, point: Point) {
+        let old = self.chrome.divider_lit();
         let width = bounds(self.window).width();
         let x = map_point(window, self.window, point).x;
         match message {
@@ -652,7 +817,16 @@ impl App {
             }
             _ => {}
         }
-        redraw(window);
+        let next = self.chrome.divider_lit();
+        if old != next {
+            motion::animate(
+                self.window,
+                Key::control(window, Effect::Hover),
+                Area::Control,
+                old,
+                next,
+            );
+        }
     }
 
     pub(super) fn save_sidebar_settings(&self) {
@@ -728,6 +902,41 @@ impl App {
         None
     }
 
+    fn tab_cell(&self, index: usize) -> Option<Rect> {
+        let view = bounds(self.chrome.tabs);
+        let (viewport, _) = self.tab_limits(view.width());
+        let document = self.documents.get(index)?;
+        let offset = self.documents[..index]
+            .iter()
+            .map(|doc| self.tab_width(doc))
+            .sum::<i32>()
+            - self.chrome.tab_offset;
+        let cell = Rect {
+            left: offset.max(0),
+            right: (offset + self.tab_width(document)).min(viewport),
+            ..view
+        };
+        (cell.width() > 0).then_some(cell)
+    }
+
+    pub(super) fn animate_editor_tabs(&self, previous: Option<usize>, next: Option<usize>) {
+        if previous == next {
+            return;
+        }
+        for index in previous.into_iter().chain(next) {
+            if let Some(rect) = self.tab_cell(index) {
+                let selected = Some(index) == next;
+                motion::animate(
+                    self.window,
+                    Key::item(self.chrome.tabs, index, Effect::Selected),
+                    Area::Rect(rect),
+                    !selected,
+                    selected,
+                );
+            }
+        }
+    }
+
     fn paint_tabs(&self, dc: Handle, rect: Rect, palette: Paint) {
         fill(dc, rect, palette.chrome);
         let (viewport, maximum) = self.tab_limits(rect.width());
@@ -744,30 +953,26 @@ impl App {
             if end > 0 {
                 let active = self.active == Some(index);
                 let over = hovered.is_some_and(|(tab, _)| tab == index);
+                let selected =
+                    motion::value(Key::item(self.chrome.tabs, index, Effect::Selected), active);
+                let hover =
+                    motion::value(Key::item(self.chrome.tabs, index * 2, Effect::Hover), over);
                 let cell = Rect {
                     left: start.max(0),
                     right: end.min(viewport),
                     ..rect
                 };
-                fill(
-                    dc,
-                    cell,
-                    if active {
-                        palette.background
-                    } else if over {
-                        palette.selected
-                    } else {
-                        palette.chrome
-                    },
-                );
-                if active {
-                    fill(
+                let idle = motion::mix(palette.chrome_rgb, palette.selected_rgb, hover);
+                let background = motion::mix(idle, palette.editor_rgb, selected);
+                fill_color(dc, cell, background);
+                if selected > 0.0 {
+                    fill_color(
                         dc,
                         Rect {
                             bottom: rect.top + self.px(2),
                             ..cell
                         },
-                        palette.accent_brush,
+                        motion::mix(background, palette.accent, selected),
                     );
                 }
                 icon(
@@ -792,11 +997,11 @@ impl App {
                         label,
                         &document.label,
                         palette.font,
-                        if active {
-                            palette.foreground
-                        } else {
-                            palette.muted
-                        },
+                        motion::mix(
+                            palette.muted,
+                            palette.foreground,
+                            selected.max(hover * 0.35),
+                        ),
                         false,
                     );
                 }
@@ -807,20 +1012,37 @@ impl App {
                         self.px(21),
                         rect.height() - self.px(10),
                     );
-                    if hovered == Some((index, true)) {
-                        fill(dc, close, palette.control);
+                    let over_close = motion::value(
+                        Key::item(self.chrome.tabs, index * 2 + 1, Effect::Hover),
+                        hovered == Some((index, true)),
+                    );
+                    if over_close > 0.0 {
+                        fill_color(
+                            dc,
+                            close,
+                            motion::mix(background, palette.control_rgb, over_close),
+                        );
                     }
-                    if active || over || document.dirty {
+                    let visibility = if document.dirty {
+                        1.0
+                    } else {
+                        selected.max(hover)
+                    };
+                    if visibility > 0.0 {
                         draw_label(
                             dc,
                             close,
                             if document.dirty && !over { "●" } else { "×" },
                             palette.font,
-                            if document.dirty {
-                                palette.accent
-                            } else {
-                                palette.foreground
-                            },
+                            motion::mix(
+                                background,
+                                if document.dirty {
+                                    palette.accent
+                                } else {
+                                    palette.foreground
+                                },
+                                visibility,
+                            ),
                             true,
                         );
                     }
@@ -878,18 +1100,55 @@ impl App {
                     }
                 };
                 let next = (message == WM_MOUSEMOVE).then_some(point);
-                let changed = self.chrome.tab_hover.map(target) != next.map(target);
+                let old = self.chrome.tab_hover.map(target);
+                let current = next.map(target);
                 self.chrome.tab_hover = next;
-                if !changed {
+                if old == current {
                     return;
                 }
+                let old_tab = old.and_then(|hit| hit.0);
+                let new_tab = current.and_then(|hit| hit.0);
+                for (offset, filter) in [(0, false), (1, true)] {
+                    let tab = |hit: Option<(usize, bool)>| {
+                        hit.filter(|&(_, close)| !filter || close).map(|hit| hit.0)
+                    };
+                    let from = tab(old_tab);
+                    let to = tab(new_tab);
+                    if from == to {
+                        continue;
+                    }
+                    for index in from.into_iter().chain(to) {
+                        if let Some(rect) = self.tab_cell(index) {
+                            let on = Some(index) == to;
+                            motion::animate(
+                                self.window,
+                                Key::item(self.chrome.tabs, index * 2 + offset, Effect::Hover),
+                                Area::Rect(rect),
+                                !on,
+                                on,
+                            );
+                        }
+                    }
+                }
+                if old.and_then(|hit| hit.1) != current.and_then(|hit| hit.1) {
+                    repaint_rect(
+                        self.chrome.tabs,
+                        Rect {
+                            left: viewport,
+                            ..bounds(self.chrome.tabs)
+                        },
+                    );
+                }
+                return;
             }
             WM_MOUSEWHEEL => {
+                motion::clear(self.chrome.tabs);
                 let delta = (wp >> 16) as i16 as i32;
                 self.chrome.tab_offset = (self.chrome.tab_offset - delta).clamp(0, max);
             }
             WM_LBUTTONDOWN | WM_MBUTTONDOWN => {
                 if point.x >= viewport && max > 0 {
+                    motion::clear(self.chrome.tabs);
                     let step = self.px(132)
                         * if point.x < viewport + self.px(29) {
                             -1
@@ -925,6 +1184,11 @@ impl App {
             .menu
             .as_ref()
             .map_or_else(|| unsafe { GetFocus() }, |menu| menu.previous_focus);
+        if let Some(previous) = self.menu_owner().filter(|&id| id != 0 && id != owner) {
+            self.animate_menu_button(previous, false);
+        }
+        self.chrome.closing_menu = None;
+        motion::clear(self.chrome.popup);
         self.chrome.menu = Some(Menu {
             owner,
             rows: rows
@@ -937,16 +1201,19 @@ impl App {
             previous_focus,
         });
         self.position_menu();
-        repaint(self.chrome.popup);
-        for &(button, _) in &self.toolbar {
-            redraw(button);
-        }
+        self.animate_menu_button(owner, true);
+        self.animate_menu_reveal(true);
         unsafe {
             SetFocus(self.chrome.popup);
         }
     }
 
     pub(super) fn show_suggestions(&mut self, suggestions: Suggestions) {
+        let opening = self.suggestion_editor() != Some(suggestions.editor);
+        if opening {
+            self.chrome.closing_menu = None;
+            motion::clear(self.chrome.popup);
+        }
         let selected = self.chrome.menu.as_ref().and_then(|menu| {
             let current = menu.completion.as_ref()?;
             if current.editor != suggestions.editor {
@@ -978,7 +1245,31 @@ impl App {
             completion: Some(suggestions),
         });
         self.position_menu();
+        if opening {
+            self.animate_menu_reveal(true);
+        }
         self.reveal_menu_row();
+    }
+
+    fn animate_menu_button(&self, id: usize, open: bool) {
+        let window = self.toolbar_handle(id);
+        motion::animate(
+            self.window,
+            Key::control(window, Effect::Selected),
+            Area::Control,
+            !open,
+            open,
+        );
+    }
+
+    fn animate_menu_reveal(&self, open: bool) {
+        motion::animate(
+            self.window,
+            Key::control(self.chrome.popup, Effect::Reveal),
+            Area::Control,
+            !open,
+            open,
+        );
     }
 
     pub(super) fn suggestion_editor(&self) -> Option<Handle> {
@@ -1054,11 +1345,8 @@ impl App {
     pub(super) fn close_menu(&mut self, restore: bool) {
         if let Some(menu) = self.chrome.menu.take() {
             self.chrome.popup_bounds.set(None);
-            show(self.chrome.popup, false);
             if menu.completion.is_none() {
-                for &(button, _) in &self.toolbar {
-                    redraw(button);
-                }
+                self.animate_menu_button(menu.owner, false);
             }
             if restore && menu.previous_focus != 0 && menu.previous_focus != self.chrome.popup {
                 unsafe {
@@ -1066,6 +1354,70 @@ impl App {
                 }
             } else if restore {
                 self.focus_editor();
+            }
+            if motion::enabled() {
+                self.chrome.closing_menu = Some(menu);
+                self.animate_menu_reveal(false);
+                self.finish_chrome_motion();
+            } else {
+                show(self.chrome.popup, false);
+            }
+        }
+    }
+
+    pub(super) fn animate_editor_tools(&mut self, open: bool) {
+        let key = Key::control(self.editor_tools, Effect::Reveal);
+        if open {
+            self.cancel_editor_tools_motion();
+        } else {
+            for window in [
+                self.mode_label,
+                self.query,
+                self.replacement,
+                self.action,
+                self.second,
+                self.third,
+                self.dismiss,
+            ] {
+                show(window, false);
+            }
+            self.chrome.closing_editor_tools = true;
+        }
+        motion::animate(self.window, key, Area::Control, !open, open);
+        self.finish_chrome_motion();
+    }
+
+    pub(super) fn cancel_editor_tools_motion(&mut self) {
+        if self.chrome.closing_editor_tools {
+            self.chrome.closing_editor_tools = false;
+            clear_clip(self.editor_tools);
+        }
+        motion::clear(self.editor_tools);
+    }
+
+    pub(super) fn finish_chrome_motion(&mut self) {
+        if self.chrome.closing_menu.is_some()
+            && !motion::active(Key::control(self.chrome.popup, Effect::Reveal))
+        {
+            self.chrome.closing_menu = None;
+            show(self.chrome.popup, false);
+        }
+        if self.chrome.closing_editor_tools {
+            let key = Key::control(self.editor_tools, Effect::Reveal);
+            if motion::active(key) {
+                let area = bounds(self.editor_tools);
+                let height =
+                    ((area.height() as f32 * motion::value(key, false)).round() as i32).max(1);
+                clip_client(
+                    self.editor_tools,
+                    Rect {
+                        top: area.bottom - height,
+                        ..area
+                    },
+                );
+            } else {
+                show(self.editor_tools, false);
+                self.cancel_editor_tools_motion();
             }
         }
     }
@@ -1090,6 +1442,7 @@ impl App {
                 }
             }
             0x24 | 0x23 | 0x26 | 0x28 => {
+                let old = menu.active;
                 let next = |index| {
                     menu.rows
                         .iter()
@@ -1113,6 +1466,8 @@ impl App {
                     0x26 => menu.active.and_then(prev).or_else(|| prev(menu.rows.len())),
                     _ => next(menu.active.map_or(0, |i| i + 1)).or_else(|| next(0)),
                 };
+                let next = menu.active;
+                self.animate_menu_selection(old, next);
                 self.reveal_menu_row();
             }
             0x25 | 0x27
@@ -1193,9 +1548,26 @@ impl App {
                 index
             };
             if next != menu.active {
+                let previous = menu.active;
                 self.chrome.menu.as_mut().expect("visible menu").active = next;
-                repaint(self.chrome.popup);
+                self.animate_menu_selection(previous, next);
             }
+        }
+    }
+
+    fn animate_menu_selection(&self, old: Option<usize>, next: Option<usize>) {
+        if old == next {
+            return;
+        }
+        for index in old.into_iter().chain(next) {
+            let selected = Some(index) == next;
+            motion::animate(
+                self.window,
+                Key::item(self.chrome.popup, index, Effect::Hover),
+                Area::Control,
+                !selected,
+                selected,
+            );
         }
     }
 
@@ -1233,28 +1605,47 @@ impl App {
     }
 
     fn paint_menu(&self, dc: Handle, rect: Rect, palette: Paint) {
-        let Some(menu) = self.chrome.menu.as_ref() else {
+        let Some(menu) = self
+            .chrome
+            .menu
+            .as_ref()
+            .or(self.chrome.closing_menu.as_ref())
+        else {
             return;
         };
-        fill(dc, rect, palette.border);
-        fill(
+        let shown = motion::value(
+            Key::control(self.chrome.popup, Effect::Reveal),
+            self.chrome.menu.is_some(),
+        );
+        let background = motion::mix(palette.panel_rgb, palette.menu_rgb, shown);
+        let text_tone = |color| motion::mix(background, color, shown);
+        fill_color(dc, rect, text_tone(palette.border_rgb));
+        fill_color(
             dc,
             Rect::from_size(1, 1, rect.width() - 2, rect.height() - 2),
-            palette.menu,
+            background,
         );
-        let mut y = self.px(4) - menu.scroll;
+        let mut y = self.px(4) - menu.scroll - ((1.0 - shown) * self.px(4) as f32).round() as i32;
         for (index, (id, text)) in menu.rows.iter().enumerate() {
             let height = self.px(if *id == 0 { 9 } else { 27 });
             let row = Rect::from_size(self.px(4), y, rect.width() - 2 * self.px(4), height);
             if *id == 0 {
-                fill(
+                fill_color(
                     dc,
                     Rect::from_size(self.px(9), y + height / 2, rect.width() - self.px(18), 1),
-                    palette.border,
+                    text_tone(palette.border_rgb),
                 );
             } else {
-                if menu.active == Some(index) {
-                    fill(dc, row, palette.selected);
+                let selected = motion::value(
+                    Key::item(self.chrome.popup, index, Effect::Hover),
+                    menu.active == Some(index),
+                );
+                if selected > 0.0 {
+                    fill_color(
+                        dc,
+                        row,
+                        motion::mix(background, palette.selected_rgb, selected * shown),
+                    );
                 }
                 let label = Rect {
                     left: self.px(14),
@@ -1272,7 +1663,7 @@ impl App {
                         },
                         name,
                         palette.font,
-                        palette.foreground,
+                        text_tone(palette.foreground),
                         false,
                     );
                     draw_label(
@@ -1283,11 +1674,18 @@ impl App {
                         },
                         shortcut,
                         palette.font,
-                        palette.muted,
+                        text_tone(palette.muted),
                         false,
                     );
                 } else {
-                    draw_label(dc, label, text, palette.font, palette.foreground, false);
+                    draw_label(
+                        dc,
+                        label,
+                        text,
+                        palette.font,
+                        text_tone(palette.foreground),
+                        false,
+                    );
                 }
             }
             y += height;
@@ -1423,32 +1821,8 @@ pub(super) fn icon(dc: Handle, point: Point, code: usize, palette: Paint, dpi: i
                 true,
             );
         }
-        draw_label(
-            dc,
-            Rect {
-                left: rect.left - size,
-                right: rect.left,
-                ..rect
-            },
-            if open { "▾" } else { "▸" },
-            palette.font,
-            palette.muted,
-            true,
-        );
     } else if matches!(code, 50 | 51) {
         paint_file_mark(dc, rect, 17, palette, dpi);
-        draw_label(
-            dc,
-            Rect {
-                left: rect.left - size,
-                right: rect.left,
-                ..rect
-            },
-            if code == 51 { "▾" } else { "▸" },
-            palette.font,
-            palette.muted,
-            true,
-        );
     } else if matches!(code, 3 | 10 | 15..=19) {
         paint_file_mark(dc, rect, code, palette, dpi);
     } else {
@@ -1552,18 +1926,12 @@ fn paint_file_mark(dc: Handle, rect: Rect, code: usize, palette: Paint, dpi: i32
 }
 
 pub(super) fn paint_file_row(item: &DrawItem, palette: Paint, dpi: i32) {
-    let selected = item.state & 1 != 0;
-    fill(
-        item.dc,
-        item.rect,
-        if selected {
-            palette.selected
-        } else if row_hovered(item) {
-            palette.control
-        } else {
-            palette.panel
-        },
+    let selected = motion::value(
+        Key::item(item.window, item.item as usize, Effect::Selected),
+        item.state & 1 != 0,
     );
+    let background = file_row_tint(item, palette);
+    fill_color(item.dc, item.rect, background);
     if item.item == u32::MAX {
         return;
     }
@@ -1587,14 +1955,14 @@ pub(super) fn paint_file_row(item: &DrawItem, palette: Paint, dpi: i32) {
         );
         return;
     }
-    if selected {
-        fill(
+    if selected > 0.0 {
+        fill_color(
             item.dc,
             Rect {
                 right: item.rect.left + px(2),
                 ..item.rect
             },
-            palette.accent_brush,
+            motion::mix(background, palette.accent, selected),
         );
     }
     let x = item.rect.left + px(20) + depth * px(14);
@@ -1608,12 +1976,27 @@ pub(super) fn paint_file_row(item: &DrawItem, palette: Paint, dpi: i32) {
             );
         }
     }
+    let center_y = (item.rect.top + item.rect.bottom) / 2;
+    let tree = folder_shape(code) || matches!(code, 50 | 51);
+    if tree {
+        let open = motion::value(
+            Key::item(item.window, item.item as usize, Effect::Arrow),
+            !code.is_multiple_of(2),
+        );
+        chevron(
+            item.dc,
+            Point {
+                x: x - px(10),
+                y: center_y,
+            },
+            px(3).max(2),
+            open,
+            palette.muted,
+        );
+    }
     icon(
         item.dc,
-        Point {
-            x,
-            y: (item.rect.top + item.rect.bottom) / 2,
-        },
+        Point { x, y: center_y },
         code,
         palette,
         dpi,
@@ -1631,18 +2014,25 @@ pub(super) fn paint_file_row(item: &DrawItem, palette: Paint, dpi: i32) {
             cell,
             &label,
             palette.font,
-            if selected || folder_shape(code) {
-                palette.foreground
-            } else {
-                palette.muted
-            },
+            motion::mix(
+                palette.muted,
+                palette.foreground,
+                if tree { 1.0 } else { selected },
+            ),
             false,
         );
     }
 }
 
-pub(super) fn row_hovered(item: &DrawItem) -> bool {
-    HOVERED_ROW.get() == Some((item.window, item.item as usize))
+fn chevron(dc: Handle, center: Point, radius: i32, open: f32, color: u32) {
+    let (sin, cos) = (open * std::f32::consts::FRAC_PI_2).sin_cos();
+    let point = |x: f32, y: f32| Point {
+        x: center.x + ((x * cos - y * sin) * radius as f32).round() as i32,
+        y: center.y + ((x * sin + y * cos) * radius as f32).round() as i32,
+    };
+    let tip = point(0.7, 0.0);
+    stroke_line(dc, point(-0.6, -1.0), tip, color);
+    stroke_line(dc, point(-0.6, 1.0), tip, color);
 }
 
 #[cfg(test)]

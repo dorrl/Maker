@@ -3,6 +3,7 @@ mod screen;
 
 use super::*;
 use crate::text::TerminalDock;
+use motion::{Area, Effect, Key};
 use pty::{Event, Session, Shell, Size};
 use screen::{Ink, Screen, Style};
 
@@ -301,7 +302,11 @@ extern "system" fn proc(window: Handle, msg: u32, wp: usize, lp: isize) -> isize
                 }
             };
             if msg == WM_PAINT {
-                paint(window, draw);
+                if id == HEADER {
+                    buffered_paint(window, draw);
+                } else {
+                    paint(window, draw);
+                }
             } else {
                 draw(wp as Handle, bounds(window));
             }
@@ -524,10 +529,24 @@ impl App {
     }
 
     fn activate_terminal(&mut self, index: usize) {
+        let previous = self.terminal.active;
         self.terminal.active = index;
         self.terminal.high_surrogate = None;
         self.terminal.body_drag = None;
         self.terminal.reveal_tab(self.dpi);
+        if previous != index {
+            for tab in [previous, index] {
+                if let Some(rect) = self.terminal_tab_cell(tab) {
+                    motion::animate(
+                        self.window,
+                        Key::item(self.terminal.header, tab, Effect::Selected),
+                        Area::Rect(rect),
+                        tab == previous,
+                        tab == index,
+                    );
+                }
+            }
+        }
         let size = self.terminal.inner_size(self.dpi);
         let visible = self.terminal.visible;
         if let Some(tab) = self.terminal.active_mut() {
@@ -554,6 +573,7 @@ impl App {
         if index >= self.terminal.tabs.len() {
             return;
         }
+        motion::clear(self.terminal.header);
         self.terminal.tabs.remove(index);
         if self.terminal.tabs.is_empty() {
             self.terminal.active = 0;
@@ -768,6 +788,7 @@ impl App {
     }
 
     fn terminal_divider_mouse(&mut self, window: Handle, msg: u32, point: Point) {
+        let previous = self.terminal.divider_hover || self.terminal.panel_drag.is_some();
         let point = map_point(window, self.window, point);
         let area = self.terminal.area;
         let dock = self.settings.terminal_dock;
@@ -840,7 +861,33 @@ impl App {
             WM_MOUSELEAVE => self.terminal.divider_hover = false,
             _ => {}
         }
-        redraw(window);
+        let next = self.terminal.divider_hover || self.terminal.panel_drag.is_some();
+        if previous != next {
+            motion::animate(
+                self.window,
+                Key::control(window, Effect::Hover),
+                Area::Control,
+                previous,
+                next,
+            );
+        }
+    }
+
+    fn terminal_tab_cell(&self, index: usize) -> Option<Rect> {
+        let area = bounds(self.terminal.header);
+        let (left, room, _) = self.terminal.controls(area, self.dpi);
+        let (width, visible) = self.terminal.tab_width(area, self.dpi);
+        let slot = index.checked_sub(self.terminal.first_tab)?;
+        if slot >= visible || index >= self.terminal.tabs.len() {
+            return None;
+        }
+        let x = left + slot as i32 * width;
+        Some(Rect::from_size(
+            x,
+            0,
+            width.min((left + room - x).max(0)),
+            area.height(),
+        ))
     }
 
     fn terminal_header_mouse(&mut self, msg: u32, wp: usize, point: Point) {
@@ -848,9 +895,47 @@ impl App {
         let (left, room, action) = self.terminal.controls(rect, self.dpi);
         let (width, visible) = self.terminal.tab_width(rect, self.dpi);
         match msg {
-            WM_MOUSEMOVE => self.terminal.hover = Some(point),
-            WM_MOUSELEAVE => self.terminal.hover = None,
+            WM_MOUSEMOVE | WM_MOUSELEAVE => {
+                let hit = |point: Point| {
+                    if !rect.has(point) {
+                        return None;
+                    }
+                    if point.x >= rect.width() - 3 * action {
+                        let slot = (point.x - (rect.width() - 3 * action)) / action;
+                        let area = Rect::from_size(
+                            rect.right - (3 - slot) * action,
+                            0,
+                            action,
+                            rect.height(),
+                        );
+                        Some((usize::MAX - slot as usize, area))
+                    } else if (left..left + room).contains(&point.x) {
+                        let index = self.terminal.first_tab + ((point.x - left) / width) as usize;
+                        self.terminal_tab_cell(index).map(|area| (index, area))
+                    } else {
+                        None
+                    }
+                };
+                let previous = self.terminal.hover.and_then(hit);
+                let next_point = (msg == WM_MOUSEMOVE).then_some(point);
+                let next = next_point.and_then(hit);
+                self.terminal.hover = next_point;
+                if previous != next {
+                    for (part, rect) in previous.into_iter().chain(next) {
+                        let on = next.is_some_and(|(index, _)| index == part);
+                        motion::animate(
+                            self.window,
+                            Key::item(self.terminal.header, part, Effect::Hover),
+                            Area::Rect(rect),
+                            !on,
+                            on,
+                        );
+                    }
+                }
+                return;
+            }
             WM_MOUSEWHEEL => {
+                motion::clear(self.terminal.header);
                 let direction = ((wp >> 16) as i16).signum() as isize;
                 let max = self.terminal.tabs.len().saturating_sub(visible);
                 self.terminal.first_tab = self
@@ -886,7 +971,7 @@ impl App {
             }
             _ => {}
         }
-        redraw(self.terminal.header);
+        repaint(self.terminal.header);
     }
 
     fn terminal_body_mouse(&mut self, msg: u32, wp: usize, point: Point) {
@@ -967,17 +1052,20 @@ impl App {
             HEADER => self.paint_terminal_header(dc, rect, palette),
             DIVIDER => {
                 fill(dc, rect, palette.chrome);
-                let brush = if self.terminal.divider_hover || self.terminal.panel_drag.is_some() {
-                    palette.accent_brush
-                } else {
-                    palette.border
-                };
+                let tone = motion::value(
+                    Key::control(self.terminal.divider, Effect::Hover),
+                    self.terminal.divider_hover || self.terminal.panel_drag.is_some(),
+                );
                 let line = if self.settings.terminal_dock == TerminalDock::Bottom {
                     Rect::from_size(0, rect.height() / 2, rect.width(), 1)
                 } else {
                     Rect::from_size(rect.width() / 2, 0, 1, rect.height())
                 };
-                fill(dc, line, brush);
+                fill_color(
+                    dc,
+                    line,
+                    motion::mix(palette.border_rgb, palette.accent, tone),
+                );
             }
             BODY => self.paint_terminal_body(dc, rect, palette),
             _ => {}
@@ -1013,20 +1101,25 @@ impl App {
                 continue;
             }
             let active = index == self.terminal.active;
-            let hover = self.terminal.hover.is_some_and(|point| cell.has(point));
-            if active {
-                fill(dc, cell, palette.background);
-            } else if hover {
-                fill(dc, cell, palette.control);
-            }
-            if active {
-                fill(
+            let hover = motion::value(
+                Key::item(self.terminal.header, index, Effect::Hover),
+                self.terminal.hover.is_some_and(|point| cell.has(point)),
+            );
+            let selection = motion::value(
+                Key::item(self.terminal.header, index, Effect::Selected),
+                active,
+            );
+            let base = motion::mix(palette.chrome_rgb, palette.control_rgb, hover);
+            let background = motion::mix(base, palette.editor_rgb, selection);
+            fill_color(dc, cell, background);
+            if selection > 0.0 {
+                fill_color(
                     dc,
                     Rect {
                         bottom: self.px(2),
                         ..cell
                     },
-                    palette.accent_brush,
+                    motion::mix(background, palette.accent, selection),
                 );
             }
             draw_label(
@@ -1064,8 +1157,16 @@ impl App {
                 action,
                 rect.height(),
             );
-            if self.terminal.hover.is_some_and(|point| cell.has(point)) {
-                fill(dc, cell, palette.control);
+            let hover = motion::value(
+                Key::item(self.terminal.header, usize::MAX - index, Effect::Hover),
+                self.terminal.hover.is_some_and(|point| cell.has(point)),
+            );
+            if hover > 0.0 {
+                fill_color(
+                    dc,
+                    cell,
+                    motion::mix(palette.chrome_rgb, palette.control_rgb, hover),
+                );
             }
             draw_label(
                 dc,

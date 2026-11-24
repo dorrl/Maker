@@ -43,15 +43,10 @@ impl Explorer {
 }
 
 pub(super) fn paint_button(item: &DrawItem, palette: Paint) {
-    let selected = item.state & 0x11 != 0 || pointer_over(item.window);
-    fill(
+    fill_color(
         item.dc,
         item.rect,
-        if selected {
-            palette.selected
-        } else {
-            palette.panel
-        },
+        chrome::button_tint(item, palette, palette.panel_rgb, false),
     );
     let px = |n| n * palette.dpi / 96;
     let left = (item.rect.left + item.rect.right - px(16)) / 2;
