@@ -1,0 +1,1659 @@
+use super::*;
+
+pub(super) const SURFACE: &str = "MakerSurface";
+pub(super) const DIVIDER: usize = 310;
+pub(super) const POPUP: usize = 311;
+const FIRST_SCROLL: usize = 320;
+const LAST_SCROLL: usize = 325;
+const SCROLL_SYNC: u32 = 0x8001;
+const EXPLORER_CLICK: u32 = 0x8002;
+const TREE_ARROW: isize = 0x10;
+
+thread_local! {
+    static HOVERED_BUTTON: Cell<Handle> = const { Cell::new(0) };
+    static MODIFIED_LIST_CLICK: Cell<bool> = const { Cell::new(false) };
+    static HOVERED_ROW: Cell<Option<(Handle, usize)>> = const { Cell::new(None) };
+}
+
+fn hover_row(window: Handle, next: Option<usize>) {
+    let next = next.map(|row| (window, row));
+    let old = HOVERED_ROW.replace(next);
+    if old != next {
+        for (list, row) in old.into_iter().chain(next) {
+            if let Some(rect) = list_item_rect(list, row) {
+                repaint_rect(list, rect);
+            }
+        }
+    }
+}
+
+pub(super) fn clear_file_hover(window: Handle) {
+    if HOVERED_ROW.get().is_some_and(|(list, _)| list == window) {
+        hover_row(window, None);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct ScrollBar {
+    handle: Handle,
+    target: Handle,
+    horizontal: bool,
+    explorer: bool,
+    visible: bool,
+}
+
+#[derive(Clone, Copy)]
+enum Drag {
+    Sidebar { x: i32, width: i32, right: bool },
+    Scroll { id: usize, grab: i32 },
+}
+
+pub(super) struct Menu {
+    owner: usize,
+    rows: Vec<(usize, String)>,
+    active: Option<usize>,
+    scroll: i32,
+    completion: Option<Suggestions>,
+    previous_focus: Handle,
+}
+
+pub(super) struct Suggestions {
+    pub editor: Handle,
+    pub caret: i32,
+    pub range: Selection,
+    pub candidates: Vec<text::completion::Candidate>,
+}
+
+pub(super) struct Chrome {
+    pub(super) divider: Handle,
+    pub(super) popup: Handle,
+    pub(super) tabs: Handle,
+    tab_offset: i32,
+    tab_hover: Option<Point>,
+    divider_hover: bool,
+    scroll_hover: Option<usize>,
+    drag: Option<Drag>,
+    pub(super) menu: Option<Menu>,
+    popup_bounds: Cell<Option<Rect>>,
+    bars: [ScrollBar; 6],
+    scroll_clips: [(Handle, Rect); 4],
+}
+
+impl Chrome {
+    pub(super) fn new(window: Handle) -> io::Result<Self> {
+        let surface = |id, style| child(window, id, SURFACE, "", style);
+        let tabs = surface(TABS, WS_TABSTOP)?;
+        let divider = surface(DIVIDER, 0)?;
+        let mut bars = [ScrollBar::default(); 6];
+        for (index, bar) in bars.iter_mut().enumerate() {
+            bar.handle = surface(FIRST_SCROLL + index, 0)?;
+            bar.explorer = matches!(index, 0 | 5);
+            bar.horizontal = matches!(index, 2 | 4);
+        }
+        Ok(Self {
+            tabs,
+            divider,
+            bars,
+            popup: surface(POPUP, 0)?,
+            tab_offset: 0,
+            tab_hover: None,
+            divider_hover: false,
+            scroll_hover: None,
+            drag: None,
+            menu: None,
+            popup_bounds: Cell::new(None),
+            scroll_clips: [(0, Rect::default()); 4],
+        })
+    }
+}
+
+pub(super) fn register() -> io::Result<()> {
+    register_class(SURFACE, surface_proc)
+}
+
+extern "system" fn surface_proc(window: Handle, message: u32, wp: usize, lp: isize) -> isize {
+    let id = unsafe { GetDlgCtrlID(window) } as usize;
+    match message {
+        WM_PAINT => {
+            if matches!(id, POPUP | TABS) {
+                buffered_paint(window, |dc, rect| draw_surface(id, dc, rect));
+            } else {
+                paint(window, |dc, rect| draw_surface(id, dc, rect));
+            }
+            return 0;
+        }
+        WM_PRINTCLIENT => {
+            draw_surface(id, wp as Handle, bounds(window));
+            return 0;
+        }
+        WM_ERASEBKGND => return 1,
+        WM_SETCURSOR if id == DIVIDER => {
+            cursor(32644);
+            return 1;
+        }
+        WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK
+        | WM_MBUTTONDOWN | WM_MOUSEWHEEL | WM_CAPTURECHANGED => {
+            with_app(|app| app.surface_mouse(window, id, message, wp, Point::packed(lp)));
+            return 0;
+        }
+        _ => {}
+    }
+    unsafe { DefWindowProcW(window, message, wp, lp) }
+}
+
+fn draw_surface(id: usize, dc: Handle, rect: Rect) {
+    if let Some(palette) = PAINT.get() {
+        if id != POPUP {
+            fill(dc, rect, palette.background);
+        }
+        let painted = with_app(|app| app.paint_surface(id, dc, rect, palette));
+        if id == POPUP && painted.is_none() {
+            fill(dc, rect, palette.menu);
+        }
+    }
+}
+
+pub(super) fn watch_control(window: Handle, toolbar: bool) {
+    subclass(window, control_proc, usize::from(toolbar));
+}
+
+extern "system" fn control_proc(
+    window: Handle,
+    message: u32,
+    wp: usize,
+    lp: isize,
+    _id: usize,
+    toolbar: usize,
+) -> isize {
+    let parent = unsafe { GetParent(window) };
+    if toolbar != 0 && message == WM_MOUSEMOVE {
+        // Only the first move in a hover needs to invalidate an owner-drawn button.
+        if HOVERED_BUTTON.replace(window) != window {
+            watch_mouse(window);
+            repaint(window);
+        }
+    }
+    if toolbar != 0 && message == WM_MOUSELEAVE {
+        if HOVERED_BUTTON.get() == window {
+            HOVERED_BUTTON.set(0);
+        }
+        repaint(window);
+    }
+    let list = toolbar == 0 && unsafe { GetDlgCtrlID(window) } == LIST as i32;
+    let row_list =
+        list || toolbar == 0 && unsafe { GetDlgCtrlID(window) } == git::GRAPH_LIST as i32;
+    if row_list && message == WM_MOUSEMOVE {
+        if HOVERED_ROW.get().is_none_or(|(list, _)| list != window) {
+            watch_mouse(window);
+        }
+        hover_row(window, list_at(window, lp));
+    }
+    if row_list && matches!(message, WM_MOUSELEAVE | WM_MOUSEWHEEL) {
+        clear_file_hover(window);
+    }
+    if list && matches!(message, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK) {
+        let modifiers = wp & 0x0c;
+        MODIFIED_LIST_CLICK.set(modifiers != 0);
+        if modifiers != 0 {
+            if let Some(row) = list_at(window, lp) {
+                unsafe {
+                    SetFocus(window);
+                }
+                list_modified_click(window, row, modifiers & 4 != 0, modifiers & 8 != 0);
+                unsafe {
+                    PostMessageW(parent, EXPLORER_CLICK, row, modifiers as isize);
+                }
+            }
+            return 0;
+        }
+    }
+    if list && message == WM_LBUTTONUP && MODIFIED_LIST_CLICK.replace(false) {
+        return 0;
+    }
+    let result = unsafe { DefSubclassProc(window, message, wp, lp) };
+    if list
+        && message == WM_LBUTTONUP
+        && let Some(item) = list_at(window, lp)
+    {
+        let data = send(window, 0x0199, item, 0) as usize;
+        let dpi = PAINT.get().map_or(96, |paint| paint.dpi);
+        let depth = (data >> 8).min(40) as i32;
+        let icon_left = (20 + depth * 14) * dpi / 96;
+        let arrow = if Point::packed(lp).x < icon_left {
+            TREE_ARROW
+        } else {
+            0
+        };
+        unsafe {
+            PostMessageW(parent, EXPLORER_CLICK, item, arrow);
+        }
+    }
+    if toolbar == 0
+        && matches!(
+            message,
+            WM_MOUSEWHEEL
+                | WM_HSCROLL
+                | WM_VSCROLL
+                | WM_KEYDOWN
+                | WM_LBUTTONUP
+                | WM_SIZE
+                | 0x0102
+                | EM_SETSCROLLPOS
+                | EM_SCROLLCARET
+        )
+    {
+        unsafe {
+            PostMessageW(parent, SCROLL_SYNC, window as usize, 0);
+        }
+    }
+    result
+}
+
+pub(super) fn handle_parent_message(message: u32, wp: usize, modifiers: isize) -> bool {
+    match message {
+        SCROLL_SYNC => {
+            with_app(|app| {
+                app.redraw_scroll_position(wp as Handle);
+            });
+        }
+        EXPLORER_CLICK => {
+            with_app(|app| {
+                if (app.is_tree() || app.git.open)
+                    && wp < app.list_items.len()
+                    && modifiers & 0x0c == 0
+                {
+                    list_select(app.list, wp);
+                    app.track_explorer_selection();
+                    let opened = match app.list_items.get(wp) {
+                        Some(ListItem::Archive { path, .. }) if modifiers == TREE_ARROW => {
+                            app.archive_toggle(path.clone())
+                        }
+                        _ => app.open_selected(),
+                    };
+                    if let Err(error) = opened {
+                        app.show_error(error);
+                    } else {
+                        unsafe {
+                            SetFocus(app.list);
+                        }
+                    }
+                } else if app.is_tree() {
+                    app.track_explorer_selection();
+                }
+            });
+        }
+        _ => return false,
+    }
+    true
+}
+
+struct Thumb {
+    start: i32,
+    length: i32,
+    travel: i32,
+    min: i32,
+    range: i32,
+}
+
+impl Thumb {
+    fn measure(info: ScrollInfo, track: i32, minimum: i32) -> Option<Self> {
+        let total = i64::from(info.max) - i64::from(info.min) + 1;
+        let page = i64::from(info.page.max(1));
+        if total <= page || track <= minimum {
+            return None;
+        }
+        let range = (total - page).min(i64::from(i32::MAX)) as i32;
+        let length = (i64::from(track) * page / total) as i32;
+        let length = length.clamp(minimum, track);
+        let travel = track - length;
+        let offset = (i64::from(info.position) - i64::from(info.min)).clamp(0, i64::from(range));
+        let start = (offset * i64::from(travel) / i64::from(range)) as i32;
+        Some(Self {
+            start,
+            length,
+            travel,
+            min: info.min,
+            range,
+        })
+    }
+
+    fn position(&self, offset: i32) -> i32 {
+        let value = i64::from(offset.clamp(0, self.travel)) * i64::from(self.range);
+        self.min
+            .saturating_add(((value + i64::from(self.travel) / 2) / i64::from(self.travel)) as i32)
+    }
+}
+
+impl App {
+    pub(super) fn sync_scrollbars(&mut self) {
+        let second = self.other.map(|index| self.documents[index].editor);
+        let active = self.editor();
+        let targets = [
+            self.sidebar.then_some(self.list),
+            active,
+            active,
+            second,
+            second,
+            self.graph_visible().then_some(self.git.graph.list),
+        ];
+        for (index, target) in targets.into_iter().enumerate() {
+            let bar = &mut self.chrome.bars[index];
+            let was_visible = bar.visible;
+            bar.visible = false;
+            bar.target = target.unwrap_or(0);
+            if let Some(target) = target {
+                let outer = relative_rect(target, self.window);
+                let inner = bounds(target);
+                let origin = map_point(target, self.window, Point::default());
+                if !bar.horizontal {
+                    let index = match index {
+                        0 => 0,
+                        1 => 1,
+                        3 => 2,
+                        _ => 3,
+                    };
+                    let clip = Rect::from_size(
+                        origin.x - outer.left,
+                        origin.y - outer.top,
+                        inner.width(),
+                        inner.height(),
+                    );
+                    if self.chrome.scroll_clips[index] != (target, clip)
+                        && clip.width() > 0
+                        && clip.height() > 0
+                    {
+                        clip_client(target, clip);
+                        self.chrome.scroll_clips[index] = (target, clip);
+                    }
+                }
+                let right = origin.x + inner.right;
+                let bottom = origin.y + inner.bottom;
+                let rect = if bar.horizontal {
+                    Rect::from_size(
+                        origin.x,
+                        bottom,
+                        outer.right - origin.x,
+                        outer.bottom - bottom,
+                    )
+                } else {
+                    Rect::from_size(right, origin.y, outer.right - right, bottom - origin.y)
+                };
+                if rect.width() > 2 && rect.height() > 2 {
+                    if !was_visible || relative_rect(bar.handle, self.window) != rect {
+                        show_overlay(bar.handle, rect);
+                    }
+                    repaint(bar.handle);
+                    bar.visible = true;
+                }
+            }
+            if was_visible && !bar.visible {
+                show(bar.handle, false);
+            }
+        }
+    }
+
+    pub(super) fn redraw_scroll_position(&mut self, target: Handle) {
+        for bar in &self.chrome.bars {
+            if bar.visible && bar.target == target {
+                repaint(bar.handle);
+            }
+        }
+        if self.editor() == Some(target) {
+            repaint(self.gutter);
+        }
+        self.schedule_viewport_highlight(target);
+    }
+
+    fn thumb(&self, bar: ScrollBar, rect: Rect) -> Option<Thumb> {
+        let info = scrollbar(bar.target, bar.horizontal)?;
+        Thumb::measure(
+            info,
+            if bar.horizontal {
+                rect.width()
+            } else {
+                rect.height()
+            },
+            self.px(20),
+        )
+    }
+
+    fn scroll_to(&mut self, id: usize, coord: i32, grab: i32) {
+        let bar = self.chrome.bars[id - FIRST_SCROLL];
+        if !bar.visible {
+            return;
+        }
+        let Some(thumb) = self.thumb(bar, bounds(bar.handle)) else {
+            return;
+        };
+        let position = thumb.position(coord.saturating_sub(grab));
+        if bar.explorer {
+            send(bar.target, LB_SETTOPINDEX, position as usize, 0);
+        } else if thumb.range > u16::MAX.into() {
+            let mut scroll = Point {
+                x: scrollbar(bar.target, true).map_or(0, |bar| bar.position),
+                y: scrollbar(bar.target, false).map_or(0, |bar| bar.position),
+            };
+            if bar.horizontal {
+                scroll.x = position;
+            } else {
+                scroll.y = position;
+            }
+            send(bar.target, EM_SETSCROLLPOS, 0, &scroll as *const _ as isize);
+        } else {
+            set_scroll_thumb(bar.target, bar.horizontal, position);
+            let message = if bar.horizontal {
+                WM_HSCROLL
+            } else {
+                WM_VSCROLL
+            };
+            send(
+                bar.target,
+                message,
+                5 | ((position as u16 as usize) << 16),
+                0,
+            );
+        }
+        if bar.explorer {
+            clear_file_hover(bar.target);
+        }
+        self.redraw_scroll_position(bar.target);
+    }
+
+    fn paint_surface(&self, id: usize, dc: Handle, rect: Rect, palette: Paint) {
+        match id {
+            TABS => self.paint_tabs(dc, rect, palette),
+            DIVIDER => {
+                let lit = self.chrome.divider_hover
+                    || matches!(self.chrome.drag, Some(Drag::Sidebar { .. }));
+                fill(dc, rect, palette.panel);
+                let thickness = self.px(if lit { 2 } else { 1 });
+                fill(
+                    dc,
+                    Rect::from_size((rect.width() - thickness) / 2, 0, thickness, rect.height()),
+                    if lit {
+                        palette.accent_brush
+                    } else {
+                        palette.border
+                    },
+                );
+            }
+            POPUP => self.paint_menu(dc, rect, palette),
+            FIRST_SCROLL..=LAST_SCROLL => {
+                let bar = self.chrome.bars[id - FIRST_SCROLL];
+                fill(
+                    dc,
+                    rect,
+                    if bar.explorer {
+                        palette.panel
+                    } else {
+                        palette.background
+                    },
+                );
+                if let Some(thumb) = self.thumb(bar, rect) {
+                    let inset = self.px(3).min(
+                        if bar.horizontal {
+                            rect.height()
+                        } else {
+                            rect.width()
+                        } / 3,
+                    );
+                    let thumb_rect = if bar.horizontal {
+                        Rect::from_size(thumb.start, inset, thumb.length, rect.height() - 2 * inset)
+                    } else {
+                        Rect::from_size(inset, thumb.start, rect.width() - 2 * inset, thumb.length)
+                    };
+                    let lit = self.chrome.scroll_hover == Some(id)
+                        || matches!(self.chrome.drag, Some(Drag::Scroll { id: held, .. }) if held == id);
+                    fill(
+                        dc,
+                        thumb_rect,
+                        if lit {
+                            palette.thumb_hover
+                        } else {
+                            palette.thumb
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn surface_mouse(&mut self, window: Handle, id: usize, message: u32, wp: usize, point: Point) {
+        if message == WM_MOUSEMOVE {
+            watch_mouse(window);
+        }
+        match id {
+            DIVIDER => self.sidebar_mouse(window, message, point),
+            TABS => self.tabs_mouse(message, wp, point),
+            POPUP => self.menu_mouse(message, wp, point),
+            FIRST_SCROLL..=LAST_SCROLL => {
+                let bar = self.chrome.bars[id - FIRST_SCROLL];
+                let coord = if bar.horizontal { point.x } else { point.y };
+                match message {
+                    WM_MOUSEMOVE => {
+                        self.chrome.scroll_hover = Some(id);
+                        if let Some(Drag::Scroll { id: held, grab }) = self.chrome.drag
+                            && held == id
+                        {
+                            self.scroll_to(id, coord, grab);
+                        }
+                    }
+                    WM_MOUSELEAVE => self.chrome.scroll_hover = None,
+                    WM_LBUTTONDOWN => {
+                        if let Some(thumb) = self.thumb(bar, bounds(window)) {
+                            let grab = if (thumb.start..thumb.start + thumb.length).contains(&coord)
+                            {
+                                coord - thumb.start
+                            } else {
+                                thumb.length / 2
+                            };
+                            self.chrome.drag = Some(Drag::Scroll { id, grab });
+                            unsafe {
+                                SetCapture(window);
+                            }
+                            self.scroll_to(id, coord, grab);
+                        }
+                    }
+                    WM_LBUTTONUP | WM_CAPTURECHANGED => {
+                        if matches!(self.chrome.drag, Some(Drag::Scroll { id: held, .. }) if held == id)
+                        {
+                            self.chrome.drag = None;
+                            if message == WM_LBUTTONUP {
+                                unsafe {
+                                    ReleaseCapture();
+                                }
+                            }
+                        }
+                    }
+                    WM_MOUSEWHEEL if bar.target != 0 => {
+                        send(bar.target, WM_MOUSEWHEEL, wp, 0);
+                    }
+                    _ => {}
+                }
+                redraw(window);
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn sidebar_size(&self, width: i32) -> i32 {
+        self.clamp_sidebar(self.px(self.settings.sidebar_width), width)
+    }
+
+    fn clamp_sidebar(&self, desired: i32, width: i32) -> i32 {
+        let max = (width - self.px(220)).max(0).min(width * 2 / 3);
+        desired.clamp(self.px(144).min(max), max)
+    }
+
+    fn sidebar_mouse(&mut self, window: Handle, message: u32, point: Point) {
+        let width = bounds(self.window).width();
+        let x = map_point(window, self.window, point).x;
+        match message {
+            WM_LBUTTONDOWN => {
+                self.chrome.drag = Some(Drag::Sidebar {
+                    x,
+                    width: self.sidebar_size(width),
+                    right: self.settings.sidebar_right,
+                });
+                unsafe {
+                    SetCapture(window);
+                }
+            }
+            WM_MOUSEMOVE => {
+                self.chrome.divider_hover = true;
+                if let Some(Drag::Sidebar {
+                    x: start,
+                    width: original,
+                    right,
+                }) = self.chrome.drag
+                {
+                    let cross = if right {
+                        x < width / 4
+                    } else {
+                        x > width * 3 / 4
+                    };
+                    if self.settings.sidebar_right != right || cross {
+                        let stays_crossed = if right {
+                            x < width / 3
+                        } else {
+                            x > width * 2 / 3
+                        };
+                        self.settings.sidebar_right = if stays_crossed { !right } else { right };
+                    }
+                    let desired = if self.settings.sidebar_right != right {
+                        original
+                    } else if right {
+                        original + start - x
+                    } else {
+                        original + x - start
+                    };
+                    self.settings.sidebar_width =
+                        (self.clamp_sidebar(desired, width) * 96 / self.dpi).max(144);
+                    self.layout();
+                }
+            }
+            WM_MOUSELEAVE => self.chrome.divider_hover = false,
+            WM_LBUTTONUP | WM_CAPTURECHANGED => {
+                if matches!(self.chrome.drag, Some(Drag::Sidebar { .. })) {
+                    self.chrome.drag = None;
+                    if message == WM_LBUTTONUP {
+                        unsafe {
+                            ReleaseCapture();
+                        }
+                    }
+                    self.save_sidebar_settings();
+                }
+            }
+            WM_LBUTTONDBLCLK => {
+                self.settings.sidebar_width = Settings::default().sidebar_width;
+                self.layout();
+                self.save_sidebar_settings();
+            }
+            _ => {}
+        }
+        redraw(window);
+    }
+
+    pub(super) fn save_sidebar_settings(&self) {
+        if let Err(error) = self.settings.save() {
+            self.report(&format!("설정을 저장할 수 없습니다. {error}"));
+        }
+    }
+
+    fn tab_width(&self, document: &Document) -> i32 {
+        let letters = document
+            .label
+            .chars()
+            .map(|ch| if ch.is_ascii() { 7 } else { 13 })
+            .sum::<i32>();
+        self.px((letters + 74).clamp(118, 240))
+    }
+
+    fn tab_limits(&self, width: i32) -> (i32, i32) {
+        let total = self
+            .documents
+            .iter()
+            .map(|doc| self.tab_width(doc))
+            .sum::<i32>();
+        let viewport = if total > width {
+            (width - self.px(58)).max(0)
+        } else {
+            width
+        };
+        (viewport, (total - viewport).max(0))
+    }
+
+    pub(super) fn tab_reveal(&mut self, index: usize) {
+        let (viewport, max) = self.tab_limits(bounds(self.chrome.tabs).width());
+        let Some(document) = self.documents.get(index) else {
+            return;
+        };
+        let begin = self.documents[..index]
+            .iter()
+            .map(|doc| self.tab_width(doc))
+            .sum::<i32>();
+        let end = begin + self.tab_width(document);
+        if begin < self.chrome.tab_offset {
+            self.chrome.tab_offset = begin;
+        } else if end > self.chrome.tab_offset + viewport {
+            self.chrome.tab_offset = end - viewport;
+        }
+        self.chrome.tab_offset = self.chrome.tab_offset.clamp(0, max);
+        redraw(self.chrome.tabs);
+    }
+
+    pub(super) fn clamp_tab_scroll(&mut self) {
+        let (_, max) = self.tab_limits(bounds(self.chrome.tabs).width());
+        self.chrome.tab_offset = self.chrome.tab_offset.clamp(0, max);
+    }
+
+    fn tab_target(&self, point: Point, viewport: i32) -> Option<(usize, bool)> {
+        if point.x >= viewport
+            || point.x < 0
+            || point.y < 0
+            || point.y >= bounds(self.chrome.tabs).height()
+        {
+            return None;
+        }
+        let mut x = -self.chrome.tab_offset;
+        for (index, document) in self.documents.iter().enumerate() {
+            let end = x + self.tab_width(document);
+            if point.x >= x && point.x < end {
+                let close = end <= viewport && point.x >= end - self.px(30);
+                return Some((index, close));
+            }
+            x = end;
+        }
+        None
+    }
+
+    fn paint_tabs(&self, dc: Handle, rect: Rect, palette: Paint) {
+        fill(dc, rect, palette.chrome);
+        let (viewport, maximum) = self.tab_limits(rect.width());
+        let mut start = -self.chrome.tab_offset;
+        let hovered = self
+            .chrome
+            .tab_hover
+            .and_then(|point| self.tab_target(point, viewport));
+        for (index, document) in self.documents.iter().enumerate() {
+            let end = start + self.tab_width(document);
+            if start >= viewport {
+                break;
+            }
+            if end > 0 {
+                let active = self.active == Some(index);
+                let over = hovered.is_some_and(|(tab, _)| tab == index);
+                let cell = Rect {
+                    left: start.max(0),
+                    right: end.min(viewport),
+                    ..rect
+                };
+                fill(
+                    dc,
+                    cell,
+                    if active {
+                        palette.background
+                    } else if over {
+                        palette.selected
+                    } else {
+                        palette.chrome
+                    },
+                );
+                if active {
+                    fill(
+                        dc,
+                        Rect {
+                            bottom: rect.top + self.px(2),
+                            ..cell
+                        },
+                        palette.accent_brush,
+                    );
+                }
+                icon(
+                    dc,
+                    Point {
+                        x: start + self.px(11),
+                        y: rect.height() / 2,
+                    },
+                    file_icon(document.path.as_deref()),
+                    palette,
+                    self.dpi,
+                    cell,
+                );
+                let label = Rect {
+                    left: (start + self.px(33)).max(0),
+                    right: (end - self.px(32)).min(viewport),
+                    ..rect
+                };
+                if label.width() > 0 {
+                    draw_label(
+                        dc,
+                        label,
+                        &document.label,
+                        palette.font,
+                        if active {
+                            palette.foreground
+                        } else {
+                            palette.muted
+                        },
+                        false,
+                    );
+                }
+                if end <= viewport && end - self.px(26) >= 0 {
+                    let close = Rect::from_size(
+                        end - self.px(26),
+                        self.px(5),
+                        self.px(21),
+                        rect.height() - self.px(10),
+                    );
+                    if hovered == Some((index, true)) {
+                        fill(dc, close, palette.control);
+                    }
+                    if active || over || document.dirty {
+                        draw_label(
+                            dc,
+                            close,
+                            if document.dirty && !over { "●" } else { "×" },
+                            palette.font,
+                            if document.dirty {
+                                palette.accent
+                            } else {
+                                palette.foreground
+                            },
+                            true,
+                        );
+                    }
+                }
+                if end > 0 && end <= viewport {
+                    fill(
+                        dc,
+                        Rect::from_size(end - 1, rect.top, 1, rect.height()),
+                        palette.border,
+                    );
+                }
+            }
+            start = end;
+        }
+        if maximum > 0 {
+            for (index, arrow) in ["‹", "›"].into_iter().enumerate() {
+                let cell = Rect::from_size(
+                    viewport + index as i32 * self.px(29),
+                    0,
+                    self.px(29),
+                    rect.height(),
+                );
+                if self.chrome.tab_hover.is_some_and(|point| cell.has(point)) {
+                    fill(dc, cell, palette.control);
+                }
+                draw_label(
+                    dc,
+                    cell,
+                    arrow,
+                    palette.large_font,
+                    palette.foreground,
+                    true,
+                );
+            }
+        }
+        fill(
+            dc,
+            Rect {
+                top: rect.bottom - 1,
+                ..rect
+            },
+            palette.border,
+        );
+    }
+
+    fn tabs_mouse(&mut self, message: u32, wp: usize, point: Point) {
+        let (viewport, max) = self.tab_limits(bounds(self.chrome.tabs).width());
+        match message {
+            WM_MOUSEMOVE | WM_MOUSELEAVE => {
+                let target = |point: Point| {
+                    if max > 0 && point.x >= viewport {
+                        (None, Some(point.x >= viewport + self.px(29)))
+                    } else {
+                        (self.tab_target(point, viewport), None)
+                    }
+                };
+                let next = (message == WM_MOUSEMOVE).then_some(point);
+                let changed = self.chrome.tab_hover.map(target) != next.map(target);
+                self.chrome.tab_hover = next;
+                if !changed {
+                    return;
+                }
+            }
+            WM_MOUSEWHEEL => {
+                let delta = (wp >> 16) as i16 as i32;
+                self.chrome.tab_offset = (self.chrome.tab_offset - delta).clamp(0, max);
+            }
+            WM_LBUTTONDOWN | WM_MBUTTONDOWN => {
+                if point.x >= viewport && max > 0 {
+                    let step = self.px(132)
+                        * if point.x < viewport + self.px(29) {
+                            -1
+                        } else {
+                            1
+                        };
+                    self.chrome.tab_offset = (self.chrome.tab_offset + step).clamp(0, max);
+                } else if let Some((index, close)) = self.tab_target(point, viewport) {
+                    if close || message == WM_MBUTTONDOWN {
+                        self.close_document(index);
+                    } else {
+                        self.activate(index, true);
+                    }
+                }
+            }
+            _ => return,
+        }
+        repaint(self.chrome.tabs);
+    }
+
+    pub(super) fn open_menu(&mut self, owner: usize, rows: &[(usize, &str)]) {
+        if self
+            .chrome
+            .menu
+            .as_ref()
+            .is_some_and(|menu| menu.owner == owner && menu.completion.is_none())
+        {
+            self.close_menu(true);
+            return;
+        }
+        let previous_focus = self
+            .chrome
+            .menu
+            .as_ref()
+            .map_or_else(|| unsafe { GetFocus() }, |menu| menu.previous_focus);
+        self.chrome.menu = Some(Menu {
+            owner,
+            rows: rows
+                .iter()
+                .map(|&(id, text)| (id, text.to_owned()))
+                .collect(),
+            active: None,
+            scroll: 0,
+            completion: None,
+            previous_focus,
+        });
+        self.position_menu();
+        repaint(self.chrome.popup);
+        for &(button, _) in &self.toolbar {
+            redraw(button);
+        }
+        unsafe {
+            SetFocus(self.chrome.popup);
+        }
+    }
+
+    pub(super) fn show_suggestions(&mut self, suggestions: Suggestions) {
+        let selected = self.chrome.menu.as_ref().and_then(|menu| {
+            let current = menu.completion.as_ref()?;
+            if current.editor != suggestions.editor {
+                return None;
+            }
+            let candidate = current.candidates.get(menu.active?)?;
+            suggestions
+                .candidates
+                .iter()
+                .position(|new| new.label == candidate.label && new.kind == candidate.kind)
+        });
+        let rows = suggestions
+            .candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                (
+                    index + 1,
+                    format!("{}\t{}", candidate.label, candidate.kind.label()),
+                )
+            })
+            .collect();
+        self.chrome.menu = Some(Menu {
+            owner: 0,
+            rows,
+            active: selected.or(Some(0)),
+            scroll: 0,
+            previous_focus: suggestions.editor,
+            completion: Some(suggestions),
+        });
+        self.position_menu();
+        self.reveal_menu_row();
+    }
+
+    pub(super) fn suggestion_editor(&self) -> Option<Handle> {
+        Some(self.chrome.menu.as_ref()?.completion.as_ref()?.editor)
+    }
+
+    fn menu_geometry(&self, menu: &Menu) -> (i32, i32) {
+        let available = bounds(self.window);
+        let width = self
+            .px(if menu.completion.is_some() { 264 } else { 302 })
+            .min(available.width());
+        let height = self.menu_height(menu);
+        (width, height)
+    }
+
+    fn menu_height(&self, menu: &Menu) -> i32 {
+        self.px(8)
+            + menu
+                .rows
+                .iter()
+                .map(|row| self.px(if row.0 == 0 { 9 } else { 27 }))
+                .sum::<i32>()
+    }
+
+    pub(super) fn position_menu(&self) {
+        let Some(menu) = self.chrome.menu.as_ref() else {
+            return;
+        };
+        let available = bounds(self.window);
+        let (width, height) = self.menu_geometry(menu);
+        let anchor = if let Some(suggestions) = &menu.completion {
+            let editor = suggestions.editor;
+            let mut caret = Point::default();
+            send(
+                editor,
+                0x00d6,
+                &mut caret as *mut _ as usize,
+                suggestions.caret as isize,
+            );
+            let caret = map_point(editor, self.window, caret);
+            Rect::from_size(caret.x, caret.y, 1, self.px(self.settings.points + 9))
+        } else {
+            relative_rect(self.toolbar_handle(menu.owner), self.window)
+        };
+        let below = (available.height() - anchor.bottom - self.px(3)).max(0);
+        let above = (anchor.top - self.px(3)).max(0);
+        let graph_picker = matches!(menu.owner, git::GRAPH_BRANCH | git::GRAPH_COMPARE);
+        let opens_up =
+            (graph_picker || menu.completion.is_some()) && height > below && above > below;
+        let height = height.min(if opens_up { above } else { below }).min(
+            if menu.completion.is_some() || graph_picker {
+                self.px(224)
+            } else {
+                i32::MAX
+            },
+        );
+        let top = if opens_up {
+            anchor.top - height
+        } else {
+            anchor.bottom
+        };
+        let rect = Rect::from_size(
+            anchor.left.clamp(0, available.width() - width),
+            top.max(0),
+            width,
+            height,
+        );
+        if self.chrome.popup_bounds.replace(Some(rect)) != Some(rect) {
+            show_overlay(self.chrome.popup, rect);
+        }
+    }
+
+    pub(super) fn close_menu(&mut self, restore: bool) {
+        if let Some(menu) = self.chrome.menu.take() {
+            self.chrome.popup_bounds.set(None);
+            show(self.chrome.popup, false);
+            if menu.completion.is_none() {
+                for &(button, _) in &self.toolbar {
+                    redraw(button);
+                }
+            }
+            if restore && menu.previous_focus != 0 && menu.previous_focus != self.chrome.popup {
+                unsafe {
+                    SetFocus(menu.previous_focus);
+                }
+            } else if restore {
+                self.focus_editor();
+            }
+        }
+    }
+
+    pub(super) fn menu_owner(&self) -> Option<usize> {
+        self.chrome.menu.as_ref().map(|menu| menu.owner)
+    }
+
+    pub(super) fn menu_key(&mut self, key: i32) -> bool {
+        let Some(menu) = self.chrome.menu.as_mut() else {
+            return false;
+        };
+        match key {
+            0x1b => self.close_menu(true),
+            13 | 32 | 9
+                if key == 13
+                    || key == 9 && menu.completion.is_some()
+                    || key == 32 && menu.completion.is_none() =>
+            {
+                if let Some(index) = menu.active {
+                    self.run_menu_index(index);
+                }
+            }
+            0x24 | 0x23 | 0x26 | 0x28 => {
+                let next = |index| {
+                    menu.rows
+                        .iter()
+                        .enumerate()
+                        .skip(index)
+                        .find(|(_, row)| row.0 != 0)
+                        .map(|(i, _)| i)
+                };
+                let prev = |end| {
+                    menu.rows
+                        .iter()
+                        .enumerate()
+                        .take(end)
+                        .rev()
+                        .find(|(_, row)| row.0 != 0)
+                        .map(|(i, _)| i)
+                };
+                menu.active = match key {
+                    0x24 => next(0),
+                    0x23 => prev(menu.rows.len()),
+                    0x26 => menu.active.and_then(prev).or_else(|| prev(menu.rows.len())),
+                    _ => next(menu.active.map_or(0, |i| i + 1)).or_else(|| next(0)),
+                };
+                self.reveal_menu_row();
+            }
+            0x25 | 0x27
+                if menu.completion.is_none()
+                    && BUTTONS.iter().any(|button| button.0 == menu.owner) =>
+            {
+                let index = BUTTONS
+                    .iter()
+                    .position(|button| button.0 == menu.owner)
+                    .unwrap_or(0);
+                let next = if key == 0x25 {
+                    index + BUTTONS.len() - 1
+                } else {
+                    index + 1
+                };
+                self.command(BUTTONS[next % BUTTONS.len()].0);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn reveal_menu_row(&mut self) {
+        let popup = self.chrome.popup;
+        let viewport = bounds(popup).height();
+        let dpi = self.dpi;
+        let px = |value| value * dpi / 96;
+        if let Some(menu) = self.chrome.menu.as_mut()
+            && let Some(index) = menu.active
+        {
+            let top = px(4)
+                + menu.rows[..index]
+                    .iter()
+                    .map(|row| px(if row.0 == 0 { 9 } else { 27 }))
+                    .sum::<i32>();
+            if top < menu.scroll + px(4) {
+                menu.scroll = (top - px(4)).max(0);
+            } else if top + px(27) > menu.scroll + viewport - px(4) {
+                menu.scroll = top + px(31) - viewport;
+            }
+        }
+        repaint(popup);
+    }
+
+    fn menu_mouse(&mut self, message: u32, wp: usize, point: Point) {
+        let Some(menu) = self.chrome.menu.as_ref() else {
+            return;
+        };
+        if message == WM_MOUSEWHEEL {
+            let height = self.menu_height(menu);
+            let max = (height - bounds(self.chrome.popup).height()).max(0);
+            let delta = (wp >> 16) as i16 as i32;
+            let scroll = (menu.scroll - self.px(delta) / 2).clamp(0, max);
+            let menu = self.chrome.menu.as_mut().expect("visible menu");
+            menu.active = None;
+            menu.scroll = scroll;
+            repaint(self.chrome.popup);
+            return;
+        }
+        let mut y = self.px(4) - menu.scroll;
+        let mut index = None;
+        for (i, (id, _)) in menu.rows.iter().enumerate() {
+            let h = self.px(if *id == 0 { 9 } else { 27 });
+            if *id != 0 && (y..y + h).contains(&point.y) {
+                index = Some(i);
+                break;
+            }
+            y += h;
+        }
+        if message == WM_LBUTTONUP && bounds(self.chrome.popup).has(point) {
+            if let Some(i) = index {
+                self.run_menu_index(i);
+            }
+        } else if matches!(message, WM_MOUSEMOVE | WM_MOUSELEAVE) {
+            let next = if message == WM_MOUSELEAVE {
+                None
+            } else {
+                index
+            };
+            if next != menu.active {
+                self.chrome.menu.as_mut().expect("visible menu").active = next;
+                repaint(self.chrome.popup);
+            }
+        }
+    }
+
+    fn run_menu_index(&mut self, index: usize) {
+        let Some(menu) = self.chrome.menu.as_ref() else {
+            return;
+        };
+        let id = menu.rows[index].0;
+        if let Some(suggestions) = &menu.completion {
+            let selection_now = selection(suggestions.editor);
+            if selection_now.start != suggestions.caret
+                || selection_now.end != suggestions.caret
+                || self.completion_pending == Some(suggestions.editor)
+            {
+                self.complete(false);
+                return;
+            }
+            let editor = suggestions.editor;
+            let range = suggestions.range;
+            let choice = &suggestions.candidates[index];
+            let caret = range.start + text::wide_offset(&choice.insert, choice.caret);
+            let value = choice.insert.clone();
+            self.close_menu(false);
+            self.dismiss_completion_request();
+            select(editor, range.start, range.end);
+            self.insert(editor, &value);
+            select(editor, caret, caret);
+            send(editor, EM_SCROLLCARET, 0, 0);
+            self.focus_editor();
+            self.update_status();
+        } else {
+            self.close_menu(true);
+            self.command(id);
+        }
+    }
+
+    fn paint_menu(&self, dc: Handle, rect: Rect, palette: Paint) {
+        let Some(menu) = self.chrome.menu.as_ref() else {
+            return;
+        };
+        fill(dc, rect, palette.border);
+        fill(
+            dc,
+            Rect::from_size(1, 1, rect.width() - 2, rect.height() - 2),
+            palette.menu,
+        );
+        let mut y = self.px(4) - menu.scroll;
+        for (index, (id, text)) in menu.rows.iter().enumerate() {
+            let height = self.px(if *id == 0 { 9 } else { 27 });
+            let row = Rect::from_size(self.px(4), y, rect.width() - 2 * self.px(4), height);
+            if *id == 0 {
+                fill(
+                    dc,
+                    Rect::from_size(self.px(9), y + height / 2, rect.width() - self.px(18), 1),
+                    palette.border,
+                );
+            } else {
+                if menu.active == Some(index) {
+                    fill(dc, row, palette.selected);
+                }
+                let label = Rect {
+                    left: self.px(14),
+                    right: rect.right - self.px(14),
+                    ..row
+                };
+                if let Some((name, shortcut)) = text.split_once('\t') {
+                    let separator =
+                        rect.right - self.px(if menu.completion.is_some() { 60 } else { 108 });
+                    draw_label(
+                        dc,
+                        Rect {
+                            right: separator,
+                            ..label
+                        },
+                        name,
+                        palette.font,
+                        palette.foreground,
+                        false,
+                    );
+                    draw_label(
+                        dc,
+                        Rect {
+                            left: separator,
+                            ..label
+                        },
+                        shortcut,
+                        palette.font,
+                        palette.muted,
+                        false,
+                    );
+                } else {
+                    draw_label(dc, label, text, palette.font, palette.foreground, false);
+                }
+            }
+            y += height;
+        }
+    }
+}
+
+pub(super) fn file_icon(path: Option<&Path>) -> usize {
+    let Some(path) = path else {
+        return 0;
+    };
+    let name = path.file_name().and_then(OsStr::to_str).unwrap_or("");
+    if name.eq_ignore_ascii_case("Cargo.toml") {
+        return 15;
+    }
+    if name.eq_ignore_ascii_case("Cargo.lock")
+        || matches!(name, "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock")
+    {
+        return 16;
+    }
+    if name.to_ascii_lowercase().starts_with("readme") {
+        return 19;
+    }
+    match path
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "rs" => 3,
+        "js" | "jsx" | "mjs" | "cjs" => 4,
+        "ts" | "tsx" | "mts" | "cts" => 5,
+        "py" | "pyi" | "pyw" => 6,
+        "json" | "jsonc" | "toml" | "yaml" | "yml" | "ini" | "lock" | "xml" => 7,
+        "html" | "htm" | "svg" | "css" | "less" | "scss" => 8,
+        "md" | "markdown" | "txt" | "rst" => 9,
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "ico" | "bmp" => 10,
+        "zip" | "7z" | "rar" | "tar" | "gz" | "xz" => 17,
+        "exe" | "msi" | "dll" | "com" => 18,
+        "sh" | "ps1" | "cmd" | "bat" => 11,
+        "c" | "h" | "cpp" | "hpp" | "cs" | "java" | "go" | "rb" | "php" | "sql" => 12,
+        _ if name.starts_with('.') || name.eq_ignore_ascii_case("Dockerfile") => 7,
+        _ => 0,
+    }
+}
+
+pub(super) fn folder_icon(path: &Path, open: bool) -> usize {
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let type_id = match name.as_str() {
+        "src" | "source" => 1,
+        "app" | "apps" => 2,
+        "target" | "build" | "dist" => 3,
+        "debug" => 4,
+        "release" => 5,
+        "test" | "tests" | "__tests__" => 6,
+        ".git" => 7,
+        "assets" | "images" | "public" | "static" => 8,
+        _ => 0,
+    };
+    32 + type_id * 2 + usize::from(open)
+}
+
+fn folder_shape(code: usize) -> bool {
+    (32..=49).contains(&code)
+}
+
+pub(super) fn icon(dc: Handle, point: Point, code: usize, palette: Paint, dpi: i32, clip: Rect) {
+    let size = 18 * dpi / 96;
+    let rect = Rect::from_size(point.x, point.y - size / 2, size, size);
+    if rect.left < clip.left || rect.right > clip.right {
+        return;
+    }
+    let (glyph, tone) = match code {
+        4 => ("JS", 2),
+        5 => ("TS", 3),
+        6 => ("Py", 3),
+        7 => ("{}", 2),
+        8 => ("<>", 1),
+        9 => ("≡", 3),
+        11 => (">_", 5),
+        12 => ("# ", 4),
+        13 => ("!", 1),
+        _ => ("□", 0),
+    };
+    if folder_shape(code) {
+        let folder = (code - 32) / 2;
+        let open = !code.is_multiple_of(2);
+        let colors = [
+            rgb(141, 167, 179),
+            rgb(123, 203, 131),
+            rgb(239, 139, 138),
+            rgb(125, 175, 213),
+            rgb(246, 174, 85),
+            rgb(226, 128, 164),
+            rgb(178, 149, 226),
+            rgb(238, 144, 103),
+            rgb(93, 191, 185),
+        ];
+        let badge = ["", "‹›", "▪", "◎", "›", "↑", "✓", "•", "▧"][folder];
+        let color = colors[folder];
+        let p = |value| value * dpi / 96;
+        let inner = Rect::from_size(rect.left + p(2), rect.top + p(6), p(14), p(9));
+        fill_color(
+            dc,
+            Rect::from_size(inner.left, inner.top - p(2), p(6), p(2)),
+            color,
+        );
+        fill_color(dc, inner, color);
+        if open {
+            fill_color(
+                dc,
+                Rect::from_size(inner.left + p(2), inner.top + p(2), p(13), p(1)),
+                palette.editor_rgb,
+            );
+            fill_color(
+                dc,
+                Rect::from_size(inner.left + p(2), inner.top + p(3), p(13), p(5)),
+                color,
+            );
+        }
+        if !badge.is_empty() {
+            draw_label(
+                dc,
+                Rect::from_size(inner.left + p(4), inner.top - p(1), p(10), p(11)),
+                badge,
+                palette.icon_font,
+                rgb(27, 43, 51),
+                true,
+            );
+        }
+        draw_label(
+            dc,
+            Rect {
+                left: rect.left - size,
+                right: rect.left,
+                ..rect
+            },
+            if open { "▾" } else { "▸" },
+            palette.font,
+            palette.muted,
+            true,
+        );
+    } else if matches!(code, 50 | 51) {
+        paint_file_mark(dc, rect, 17, palette, dpi);
+        draw_label(
+            dc,
+            Rect {
+                left: rect.left - size,
+                right: rect.left,
+                ..rect
+            },
+            if code == 51 { "▾" } else { "▸" },
+            palette.font,
+            palette.muted,
+            true,
+        );
+    } else if matches!(code, 3 | 10 | 15..=19) {
+        paint_file_mark(dc, rect, code, palette, dpi);
+    } else {
+        draw_label(
+            dc,
+            rect,
+            glyph,
+            palette.icon_font,
+            palette.icons[tone],
+            true,
+        );
+    }
+}
+
+fn paint_file_mark(dc: Handle, rect: Rect, code: usize, palette: Paint, dpi: i32) {
+    let size = |value: i32| value * dpi / 96;
+    let pixel = |x, y, width, height, color| {
+        fill_color(
+            dc,
+            Rect::from_size(
+                rect.left + size(x),
+                rect.top + size(y),
+                size(width).max(1),
+                size(height).max(1),
+            ),
+            color,
+        );
+    };
+    let background = palette.editor_rgb;
+    match code {
+        3 => {
+            let orange = if palette.editor_rgb == rgb(24, 29, 35) {
+                rgb(249, 155, 103)
+            } else {
+                rgb(186, 74, 26)
+            };
+            for (x, y, w, h) in [
+                (5, 3, 8, 12),
+                (3, 5, 12, 8),
+                (8, 1, 2, 3),
+                (8, 14, 2, 3),
+                (1, 8, 3, 2),
+                (14, 8, 3, 2),
+                (3, 3, 3, 3),
+                (12, 3, 3, 3),
+                (3, 12, 3, 3),
+                (12, 12, 3, 3),
+            ] {
+                pixel(x, y, w, h, orange);
+            }
+            pixel(5, 5, 8, 8, background);
+            draw_label(dc, rect, "R", palette.icon_font, orange, true);
+        }
+        10 => {
+            let green = rgb(74, 174, 163);
+            pixel(3, 2, 12, 14, green);
+            pixel(5, 4, 8, 10, background);
+            pixel(6, 5, 2, 2, green);
+            for (x, y, w, h) in [(6, 12, 6, 1), (7, 11, 5, 1), (9, 10, 3, 1), (10, 9, 2, 1)] {
+                pixel(x, y, w, h, green);
+            }
+        }
+        15 => {
+            let coral = rgb(212, 119, 122);
+            pixel(2, 2, 14, 14, coral);
+            pixel(3, 3, 12, 12, background);
+            draw_label(dc, rect, "T", palette.icon_font, palette.foreground, true);
+        }
+        16 => {
+            let yellow = rgb(235, 179, 68);
+            pixel(6, 3, 6, 2, yellow);
+            pixel(5, 5, 2, 4, yellow);
+            pixel(11, 5, 2, 4, yellow);
+            pixel(4, 8, 10, 7, yellow);
+            pixel(8, 10, 2, 3, rgb(50, 45, 33));
+        }
+        17 => {
+            let olive = rgb(164, 175, 67);
+            pixel(4, 2, 10, 14, olive);
+            for y in 4..=12 {
+                pixel(8 + y % 2, y, 1, 1, rgb(49, 55, 35));
+            }
+            pixel(8, 13, 3, 2, rgb(49, 55, 35));
+        }
+        18 => {
+            let coral = rgb(229, 122, 104);
+            pixel(2, 4, 14, 10, coral);
+            pixel(3, 7, 12, 6, background);
+            pixel(4, 5, 1, 1, background);
+            pixel(6, 5, 1, 1, background);
+        }
+        19 => {
+            let blue = rgb(95, 178, 243);
+            pixel(5, 2, 8, 14, blue);
+            pixel(3, 4, 12, 10, blue);
+            pixel(8, 5, 2, 2, rgb(24, 43, 55));
+            pixel(8, 8, 2, 5, rgb(24, 43, 55));
+        }
+        _ => {}
+    }
+}
+
+pub(super) fn paint_file_row(item: &DrawItem, palette: Paint, dpi: i32) {
+    let selected = item.state & 1 != 0;
+    fill(
+        item.dc,
+        item.rect,
+        if selected {
+            palette.selected
+        } else if row_hovered(item) {
+            palette.control
+        } else {
+            palette.panel
+        },
+    );
+    if item.item == u32::MAX {
+        return;
+    }
+    let px = |n| n * dpi / 96;
+    let depth = (item.data >> 8).min(40) as i32;
+    let code = item.data & 255;
+    if code == 14 {
+        fill(item.dc, item.rect, palette.chrome);
+        let label = list_label(item.window, item.item as usize);
+        draw_label(
+            item.dc,
+            Rect {
+                left: item.rect.left + px(9),
+                right: item.rect.right - px(4),
+                ..item.rect
+            },
+            &label,
+            palette.font,
+            palette.muted,
+            false,
+        );
+        return;
+    }
+    if selected {
+        fill(
+            item.dc,
+            Rect {
+                right: item.rect.left + px(2),
+                ..item.rect
+            },
+            palette.accent_brush,
+        );
+    }
+    let x = item.rect.left + px(20) + depth * px(14);
+    if depth > 0 {
+        for level in 0..depth {
+            let x = item.rect.left + px(15) + level * px(14);
+            fill(
+                item.dc,
+                Rect::from_size(x, item.rect.top, 1, item.rect.height()),
+                palette.border,
+            );
+        }
+    }
+    icon(
+        item.dc,
+        Point {
+            x,
+            y: (item.rect.top + item.rect.bottom) / 2,
+        },
+        code,
+        palette,
+        dpi,
+        item.rect,
+    );
+    let label = list_label(item.window, item.item as usize);
+    let cell = Rect {
+        left: x + px(25),
+        right: item.rect.right - px(5),
+        ..item.rect
+    };
+    if cell.width() > 0 {
+        draw_label(
+            item.dc,
+            cell,
+            &label,
+            palette.font,
+            if selected || folder_shape(code) {
+                palette.foreground
+            } else {
+                palette.muted
+            },
+            false,
+        );
+    }
+}
+
+pub(super) fn row_hovered(item: &DrawItem) -> bool {
+    HOVERED_ROW.get() == Some((item.window, item.item as usize))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn thumb_scales_to_both_limits() {
+        let info = ScrollInfo::sample(0, 99999, 800, 49600);
+        let thumb = Thumb::measure(info, 300, 20).unwrap();
+        assert_eq!(thumb.start, 140);
+        assert_eq!(thumb.position(0), 0);
+        assert_eq!(thumb.position(280), 99200);
+    }
+}
