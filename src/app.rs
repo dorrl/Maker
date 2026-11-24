@@ -2,6 +2,7 @@ mod archive;
 mod chrome;
 mod explorer;
 mod git;
+mod motion;
 mod session;
 mod terminal;
 
@@ -106,13 +107,18 @@ struct Paint {
     border: Handle,
     accent_brush: Handle,
     thumb: Handle,
-    thumb_hover: Handle,
     font: Handle,
     large_font: Handle,
     icon_font: Handle,
     editor_rgb: u32,
     chrome_rgb: u32,
     panel_rgb: u32,
+    menu_rgb: u32,
+    control_rgb: u32,
+    selected_rgb: u32,
+    border_rgb: u32,
+    thumb_rgb: u32,
+    thumb_hover_rgb: u32,
     icons: [u32; 6],
     dpi: i32,
 }
@@ -193,13 +199,18 @@ impl Paint {
             border: brush(border),
             accent_brush: brush(accent),
             thumb: brush(thumb),
-            thumb_hover: brush(thumb_hover),
             font: font(13 * dpi / 96),
             large_font: font(22 * dpi / 96),
             icon_font: font(11 * dpi / 96),
             editor_rgb: background,
             chrome_rgb: chrome,
             panel_rgb: panel,
+            menu_rgb: menu,
+            control_rgb: control,
+            selected_rgb: selected,
+            border_rgb: border,
+            thumb_rgb: thumb,
+            thumb_hover_rgb: thumb_hover,
             icons,
             dpi,
         }
@@ -216,7 +227,6 @@ impl Paint {
             self.border,
             self.accent_brush,
             self.thumb,
-            self.thumb_hover,
             self.font,
             self.large_font,
             self.icon_font,
@@ -509,6 +519,11 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
             return 0;
         }
         WM_TIMER => {
+            if wp == motion::TIMER {
+                motion::tick(window);
+                with_app(App::finish_chrome_motion);
+                return 0;
+            }
             with_app(|app| match wp {
                 COLOR_TIMER => app.repaint_editor(),
                 VIEWPORT_TIMER => app.repaint_viewport(),
@@ -615,7 +630,18 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                         with_app(|app| app.paint_sidebar_tab(item, palette));
                     }
                     EDITOR_TOOLS => {
-                        fill(item.dc, item.rect, palette.border);
+                        let shade = motion::value(
+                            motion::Key::control(item.window, motion::Effect::Reveal),
+                            true,
+                        );
+                        let opening =
+                            with_app(|app| app.mode.is_some_and(Mode::floats)).unwrap_or(true);
+                        let border = if opening {
+                            motion::mix(palette.accent, palette.border_rgb, shade)
+                        } else {
+                            palette.border_rgb
+                        };
+                        fill_color(item.dc, item.rect, border);
                         fill(
                             item.dc,
                             Rect {
@@ -662,19 +688,17 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                     }
                     id => {
                         let toolbar = BUTTONS.iter().any(|button| button.0 == id);
-                        let active = toolbar
-                            && with_app(|app| app.menu_owner() == Some(id)).unwrap_or(false);
-                        let selected = item.state & 0x11 != 0
-                            || (toolbar && pointer_over(item.window))
-                            || active;
-                        let background = if selected {
-                            palette.selected
-                        } else if toolbar {
-                            palette.chrome
+                        let active = with_app(|app| app.menu_owner() == Some(id)).unwrap_or(false);
+                        let base = if toolbar {
+                            palette.chrome_rgb
                         } else {
-                            palette.control
+                            palette.control_rgb
                         };
-                        fill(item.dc, item.rect, background);
+                        fill_color(
+                            item.dc,
+                            item.rect,
+                            chrome::button_tint(item, palette, base, active),
+                        );
                         draw_label(
                             item.dc,
                             item.rect,
@@ -693,7 +717,11 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
             }
         }
         WM_SETTINGCHANGE => {
-            with_app(App::layout);
+            motion::refresh(window);
+            with_app(|app| {
+                app.finish_chrome_motion();
+                app.layout();
+            });
         }
         _ => {}
     }
@@ -704,7 +732,11 @@ impl App {
     fn new(window: Handle) -> io::Result<Self> {
         let static_label =
             |id, label| child(window, id, "STATIC", label, SS_CENTERIMAGE | SS_NOPREFIX);
-        let button = |id, label| child(window, id, "BUTTON", label, BS_OWNERDRAW | WS_TABSTOP);
+        let button = |id, label| -> io::Result<_> {
+            let control = child(window, id, "BUTTON", label, BS_OWNERDRAW | WS_TABSTOP)?;
+            chrome::watch_control(control, true);
+            Ok(control)
+        };
         let input = |id| {
             child(
                 window,
@@ -783,9 +815,6 @@ impl App {
         };
         unsafe {
             DragAcceptFiles(window, 1);
-        }
-        for &(button, _) in &app.toolbar {
-            chrome::watch_control(button, true);
         }
         chrome::watch_control(app.list, false);
         app.apply_preferences();
@@ -1293,6 +1322,7 @@ impl App {
     }
 
     fn activate(&mut self, index: usize, focus: bool) {
+        let previous = self.active;
         if self.active != Some(index) {
             self.dismiss_completion();
         }
@@ -1306,6 +1336,7 @@ impl App {
         self.active = Some(index);
         self.layout();
         self.tab_reveal(index);
+        self.animate_editor_tabs(previous, Some(index));
         self.update_status();
         if focus {
             self.focus_editor();
@@ -1591,6 +1622,7 @@ impl App {
     }
 
     fn remove_document(&mut self, index: usize, remember: bool) {
+        motion::clear(self.chrome.tabs);
         let document = self.documents.remove(index);
         if remember && let Some(path) = document.path {
             self.recently_closed.push(path);
@@ -1759,7 +1791,7 @@ impl App {
     }
 
     fn set_list(&mut self, items: Vec<ListItem>) {
-        chrome::clear_file_hover(self.list);
+        chrome::reset_file_motion(self.list);
         painting(self.list, false);
         send(self.list, LB_RESETCONTENT, 0, 0);
         for item in &items {
@@ -1857,11 +1889,13 @@ impl App {
 
     fn toggle_folder(&mut self, row: usize, path: PathBuf) -> io::Result<()> {
         self.remember_tree_focus(row, path.clone());
-        if !self.expanded.remove(&path) {
+        let open = !self.expanded.remove(&path);
+        if open {
             fs::read_dir(&path)?;
             self.expanded.insert(path);
         }
         self.show_files("");
+        chrome::animate_folder(self.list, row, open);
         Ok(())
     }
 
@@ -1880,7 +1914,7 @@ impl App {
                     (Some(ListItem::Archive { depth, .. } | ListItem::ArchiveMember { depth, .. }),
                     Some(ListItem::ArchiveMember { depth: child, .. })) if child > depth)
                 {
-                    list_select(self.list, row + 1);
+                    chrome::select_file_row(self.list, row + 1);
                 }
             }
             Some(ListItem::ArchiveMember { archive, path, directory: true, open, .. })
@@ -1895,7 +1929,7 @@ impl App {
                         source == archive && path.parent() == Some(Path::new("")),
                     _ => false,
                 }) {
-                    list_select(self.list, index);
+                    chrome::select_file_row(self.list, index);
                 }
             }
             Some(ListItem::Folder { path, open, .. }) if *open == (key == 0x25) => {
@@ -1904,14 +1938,14 @@ impl App {
             Some(ListItem::Folder { open: true, depth, .. }) if key == 0x27 => {
                 let descendant = self.list_items.get(row + 1);
                 if matches!(descendant, Some(ListItem::File(_, Some(next)) | ListItem::Folder { depth: next, .. }) if next > depth) {
-                    list_select(self.list, row + 1);
+                    chrome::select_file_row(self.list, row + 1);
                 }
             }
             Some(ListItem::Folder { path, .. } | ListItem::Archive { path, .. } | ListItem::File(path, Some(_))) if key == 0x25 => {
                 if let Some(index) = self.list_items[..row].iter().rposition(|item| {
                     matches!(item, ListItem::Folder { path: folder, .. } if Some(folder.as_path()) == path.parent())
                 }) {
-                    list_select(self.list, index);
+                    chrome::select_file_row(self.list, index);
                 }
             }
             _ => {}
@@ -2104,6 +2138,7 @@ impl App {
     }
 
     fn show_mode(&mut self, mode: Mode) {
+        let was_floating = self.mode.is_some_and(Mode::floats);
         let reflow = !mode.floats() || self.mode.is_some_and(|old| !old.floats());
         self.search = None;
         self.cancel_explorer_edit(false);
@@ -2161,6 +2196,9 @@ impl App {
         } else {
             self.layout_editor_tools(mode);
         }
+        if mode.floats() && !was_floating {
+            self.animate_editor_tools(true);
+        }
         send(self.query, 0x00b1, 0, -1);
         unsafe {
             SetFocus(self.query);
@@ -2168,6 +2206,7 @@ impl App {
     }
 
     fn clear_mode(&mut self) {
+        self.cancel_editor_tools_motion();
         self.mode = None;
         self.symbol_rename = None;
         self.cancel_explorer_edit(false);
@@ -2182,7 +2221,7 @@ impl App {
             self.mode = None;
             self.symbol_rename = None;
             self.cancel_explorer_edit(false);
-            self.layout_input(0, 0);
+            self.animate_editor_tools(false);
             self.focus_editor();
         } else {
             self.clear_mode();

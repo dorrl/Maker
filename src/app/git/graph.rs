@@ -161,7 +161,7 @@ impl Graph {
         };
         title(self.branch, &format!("커밋 · {branch} ▾"));
         title(self.compare, &format!("비교 · {compare} ▾"));
-        chrome::clear_file_hover(self.list);
+        chrome::reset_file_motion(self.list);
         let top = send(self.list, LB_GETTOPINDEX, 0, 0).max(0) as usize;
         let selected = list_caret(self.list);
         painting(self.list, false);
@@ -372,14 +372,7 @@ impl App {
     }
 
     pub(in crate::app) fn paint_graph_row(&self, item: &DrawItem, paint: Paint) {
-        let background = if item.state & 1 != 0 {
-            paint.selected
-        } else if chrome::row_hovered(item) {
-            paint.control
-        } else {
-            paint.panel
-        };
-        fill(item.dc, item.rect, background);
+        fill_color(item.dc, item.rect, chrome::file_row_tint(item, paint));
         if item.item == u32::MAX {
             return;
         }

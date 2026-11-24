@@ -199,24 +199,20 @@ impl App {
     pub(super) fn paint_sidebar_tab(&self, item: &DrawItem, palette: Paint) {
         let is_git = item.id as usize == CHANGES_VIEW;
         let active = self.git.open == is_git;
-        let over = item.state & 0x11 != 0 || pointer_over(item.window);
-        fill(
-            item.dc,
-            item.rect,
-            if active || over {
-                palette.control
-            } else {
-                palette.chrome
-            },
+        let emphasis = motion::value(
+            motion::Key::control(item.window, motion::Effect::Selected),
+            active,
         );
-        if active {
+        let tint = chrome::button_tint(item, palette, palette.chrome_rgb, active);
+        fill_color(item.dc, item.rect, tint);
+        if emphasis > 0.0 {
             let mut accent = item.rect;
             if self.settings.sidebar_right {
                 accent.left = accent.right - self.px(2);
             } else {
                 accent.right = accent.left + self.px(2);
             }
-            fill(item.dc, accent, palette.accent_brush);
+            fill_color(item.dc, accent, motion::mix(tint, palette.accent, emphasis));
         }
         let center = (item.rect.left + item.rect.right) / 2;
         let middle = (item.rect.top + item.rect.bottom) / 2;
@@ -230,11 +226,7 @@ impl App {
                     p(width).max(1),
                     p(height).max(1),
                 ),
-                if active {
-                    palette.accent
-                } else {
-                    palette.foreground
-                },
+                motion::mix(palette.foreground, palette.accent, emphasis),
             );
         };
         if is_git {
@@ -295,6 +287,7 @@ impl App {
     }
 
     pub(super) fn set_git_view(&mut self, open: bool) {
+        let previous = self.git.open;
         self.sidebar = true;
         self.git.open = open;
         if matches!(self.mode, Some(Mode::Rename)) && self.explorer.edit.is_some() {
@@ -307,8 +300,15 @@ impl App {
         }
         self.show_files("");
         self.layout();
-        repaint(self.git.explorer);
-        repaint(self.git.changes);
+        for (button, is_git) in [(self.git.explorer, false), (self.git.changes, true)] {
+            motion::animate(
+                self.window,
+                motion::Key::control(button, motion::Effect::Selected),
+                motion::Area::Control,
+                previous == is_git,
+                open == is_git,
+            );
+        }
         unsafe {
             SetFocus(self.list);
         }

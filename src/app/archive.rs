@@ -437,6 +437,7 @@ impl App {
     pub(super) fn archive_toggle(&mut self, path: PathBuf) -> io::Result<()> {
         if self.explorer.archive.opened.remove(&path) {
             self.show_files("");
+            self.animate_archive_row(&path, false);
         } else if self.explorer.archive.pending() {
             self.report("압축 파일을 처리하고 있습니다.");
         } else {
@@ -456,14 +457,16 @@ impl App {
     ) -> io::Result<()> {
         if directory {
             let key = (archive.clone(), path.clone());
-            if !self.explorer.archive.folders.remove(&key) {
+            let open = !self.explorer.archive.folders.remove(&key);
+            if open {
                 self.explorer.archive.folders.insert(key);
             }
             self.show_files("");
             if let Some(row) = self.list_items.iter().position(|item| {
                 matches!(item, ListItem::ArchiveMember { archive: source, path: entry, .. } if *source == archive && *entry == path)
             }) {
-                list_select(self.list, row);
+                chrome::select_file_row(self.list, row);
+                chrome::animate_folder(self.list, row, open);
             }
         } else if self.explorer.archive.pending() {
             self.report("압축 파일을 처리하고 있습니다.");
@@ -474,6 +477,16 @@ impl App {
             })?;
         }
         Ok(())
+    }
+
+    fn animate_archive_row(&self, path: &Path, open: bool) {
+        if let Some(row) = self
+            .list_items
+            .iter()
+            .position(|item| matches!(item, ListItem::Archive { path: item, .. } if item == path))
+        {
+            chrome::animate_folder(self.list, row, open);
+        }
     }
 
     pub(super) fn archive_extract(&mut self, path: PathBuf) -> io::Result<()> {
@@ -517,9 +530,10 @@ impl App {
                     && path.is_file()
                 {
                     self.explorer.archive.opened.insert(path.clone());
-                    self.explorer.archive.catalogs.insert(path, tree);
+                    self.explorer.archive.catalogs.insert(path.clone(), tree);
                     if self.is_tree() {
                         self.show_files("");
+                        self.animate_archive_row(&path, true);
                     }
                     self.report("압축 파일을 펼쳤습니다.");
                 }
