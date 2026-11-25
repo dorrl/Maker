@@ -36,10 +36,17 @@ struct Session {
     terminal: terminal::SavedPanel,
     git_view: bool,
     window: Option<SavedWindow>,
+    editor_layout: Option<(bool, i32, i32)>,
+    secondary: Option<PathBuf>,
+    fullscreen: bool,
+    groups: Vec<usize>,
 }
 
 impl App {
     pub(super) fn queue_session_save(&self) {
+        if self.detached {
+            return;
+        }
         unsafe {
             SetTimer(self.window, TIMER, 850, 0);
         }
@@ -49,22 +56,25 @@ impl App {
         unsafe {
             KillTimer(self.window, TIMER);
         }
+        if self.detached {
+            return Ok(());
+        }
         if self.fresh_window
             && self.root.is_none()
             && !self.documents.iter().any(|doc| {
                 !doc.is_preview()
-                    && (doc.path.is_some() || send(doc.editor, EM_GETMODIFY, 0, 0) != 0)
+                    && (session_path(doc).is_some() || send(doc.editor, EM_GETMODIFY, 0, 0) != 0)
             })
         {
             return Ok(());
         }
+        let save = |doc: &Document| {
+            !doc.is_preview() && (doc.browser.is_none() || session_path(doc).is_some())
+        };
         let saved_index = |index: Option<usize>| {
-            index.filter(|&i| !self.documents[i].is_preview()).map(|i| {
-                self.documents[..i]
-                    .iter()
-                    .filter(|doc| !doc.is_preview())
-                    .count()
-            })
+            index
+                .filter(|&i| save(&self.documents[i]))
+                .map(|i| self.documents[..i].iter().filter(|doc| save(doc)).count())
         };
         let active = saved_index(self.active);
         let other = saved_index(self.other);
@@ -91,11 +101,20 @@ impl App {
                 .collect(),
             terminal: self.terminal.saved(),
             git_view: self.git.open,
-            window: window_placement(self.window),
+            window: self.fullscreen.or_else(|| window_placement(self.window)),
+            fullscreen: self.fullscreen.is_some(),
+            groups: Vec::new(),
+            editor_layout: Some((self.dock.stacked, self.dock.ratio, self.dock.sidebar_ratio)),
+            secondary: self
+                .secondary_browser
+                .as_ref()
+                .and_then(browser::Browser::folder)
+                .map(Path::to_owned),
             open: Vec::new(),
         };
         state.recent.reverse();
-        for doc in self.documents.iter().filter(|doc| !doc.is_preview()) {
+        for doc in self.documents.iter().filter(|doc| save(doc)) {
+            state.groups.push(doc.group);
             let mut scroll = Point::default();
             send(
                 doc.editor,
@@ -104,7 +123,7 @@ impl App {
                 &mut scroll as *mut _ as isize,
             );
             state.open.push(Entry {
-                path: doc.path.clone(),
+                path: session_path(doc).map(Path::to_owned),
                 label: doc.label.clone(),
                 draft: (send(doc.editor, EM_GETMODIFY, 0, 0) != 0).then(|| editor_text(doc.editor)),
                 encoding: doc.encoding,
@@ -139,19 +158,20 @@ impl App {
         };
         if let Some(saved) = state.window {
             position_main_window(self.window, saved);
+            if state.fullscreen {
+                self.fullscreen = Some(saved);
+            }
         }
-        if let Some(root) = state.root
-            && let Ok(files) = text::files(&root)
-        {
+        if let Some(root) = state.root.filter(|path| path.is_dir()) {
             self.expanded = state
                 .expanded
                 .into_iter()
                 .filter(|path| path.starts_with(&root))
                 .collect();
             self.explorer_selection = state.selected.filter(|path| path.starts_with(&root));
+            self.files = text::files(&root).unwrap_or_default();
             self.explorer_top = state.top;
             self.root = Some(root);
-            self.files = files;
         }
         self.sidebar = state.sidebar;
         self.git.open = state.git_view;
@@ -163,6 +183,15 @@ impl App {
         for entry in state.open {
             if entry.path.is_none() && entry.draft.is_none() {
                 index_map.push(None);
+                continue;
+            }
+            if entry.draft.is_none()
+                && let Some(folder) = entry.path.as_ref().filter(|path| path.is_dir())
+            {
+                let before = self.documents.len();
+                let opened = self.add_browser(folder.clone(), true).is_ok();
+                index_map.push(opened.then_some(before));
+                skipped += usize::from(!opened);
                 continue;
             }
             let dirty = entry.draft.is_some();
@@ -195,6 +224,24 @@ impl App {
         self.active = resolve(state.active).or(self.active);
         self.other = resolve(state.other).filter(|index| self.active != Some(*index));
         self.active_right = state.active_right && self.other.is_some();
+        if let (Some(active), Some(other)) = (self.active, self.other) {
+            for (saved, loaded) in index_map.iter().enumerate() {
+                if let Some(index) = loaded {
+                    self.documents[*index].group = state.groups.get(saved).copied().unwrap_or(0);
+                }
+            }
+            self.documents[active].group = usize::from(self.active_right);
+            self.documents[other].group = usize::from(!self.active_right);
+        }
+        if let Some((stacked, ratio, sidebar_ratio)) = state.editor_layout {
+            self.dock.stacked = stacked;
+            self.dock.ratio = ratio.clamp(18, 82);
+            self.dock.sidebar_ratio = sidebar_ratio.clamp(22, 78);
+        }
+        self.secondary_browser = state
+            .secondary
+            .filter(|path| path.is_dir())
+            .and_then(|path| browser::Browser::new(self.window, path, true).ok());
         self.show_files("");
         self.restore_terminal(state.terminal);
         self.layout();
@@ -223,6 +270,9 @@ impl App {
             self.report("압축 풀기가 끝난 뒤 창을 닫을 수 있습니다.");
             return false;
         }
+        if self.detached {
+            return self.confirm_exit();
+        }
         match self.save_session() {
             Ok(()) => true,
             Err(error) => {
@@ -233,6 +283,13 @@ impl App {
             }
         }
     }
+}
+
+fn session_path(doc: &Document) -> Option<&Path> {
+    doc.browser
+        .as_ref()
+        .and_then(browser::Browser::folder)
+        .or(doc.path.as_deref())
 }
 
 fn session_file() -> io::Result<PathBuf> {
@@ -300,6 +357,17 @@ impl Session {
                 window.normal.bottom,
             ] {
                 writer.write_all(&coordinate.to_le_bytes())?;
+            }
+        }
+        if let Some((stacked, ratio, sidebar_ratio)) = self.editor_layout {
+            writer.write_all(&[u8::from(stacked)])?;
+            writer.write_all(&ratio.to_le_bytes())?;
+            writer.write_all(&sidebar_ratio.to_le_bytes())?;
+            write_path(writer, self.secondary.as_deref())?;
+            writer.write_all(&[u8::from(self.fullscreen)])?;
+            write_u32(writer, self.groups.len())?;
+            for group in &self.groups {
+                writer.write_all(&[u8::from(*group == 1)])?;
             }
         }
         Ok(())
@@ -380,6 +448,25 @@ impl Session {
                 });
             }
             Ok(false) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+            Err(error) => return Err(error),
+        }
+        match read_bool(reader) {
+            Ok(stacked) => {
+                state.editor_layout = Some((stacked, read_i32(reader)?, read_i32(reader)?));
+                state.secondary = read_path(reader)?;
+                match read_bool(reader) {
+                    Ok(fullscreen) => {
+                        state.fullscreen = fullscreen;
+                        let count = read_count(reader, MAX_ITEMS)?;
+                        for _ in 0..count {
+                            state.groups.push(usize::from(read_bool(reader)?));
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+                    Err(error) => return Err(error),
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
             Err(error) => return Err(error),
         }
@@ -489,6 +576,24 @@ fn read_paths(reader: &mut impl Read) -> io::Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preserves_editor_and_explorer_split_sizes() {
+        let session = Session {
+            editor_layout: Some((true, 63, 37)),
+            secondary: Some(PathBuf::from(r"C:\dev\second")),
+            groups: vec![0, 1, 0],
+            fullscreen: true,
+            ..Session::default()
+        };
+        let mut bytes = Vec::new();
+        session.write(&mut bytes).unwrap();
+        let restored = Session::read(&mut bytes.as_slice()).unwrap();
+        assert_eq!(restored.editor_layout, session.editor_layout);
+        assert_eq!(restored.secondary, session.secondary);
+        assert_eq!(restored.groups, session.groups);
+        assert!(restored.fullscreen);
+    }
+
     #[test]
     fn preserves_unicode_drafts_and_tab_selection() {
         let session = Session {

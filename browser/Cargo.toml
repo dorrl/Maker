@@ -1,0 +1,30 @@
+[package]
+name = "maker-browser"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyrender = "0.15"
+anyrender_vello_cpu = { version = "0.19", default-features = false }
+blitz-dom = { version = "=0.3.0-beta.5", default-features = false, features = ["system-fonts"] }
+blitz-html = { version = "=0.3.0-beta.5", default-features = false }
+blitz-paint = { version = "=0.3.0-beta.5", default-features = false }
+blitz-traits = { version = "=0.3.0-beta.5", default-features = false }
+data-url = "0.3"
+encoding_rs = "0.8"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+peniko = "0.6"
+reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
+rquickjs = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader",
+    "Win32_UI_Controls", "Win32_UI_Controls_Dialogs", "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+strip = true

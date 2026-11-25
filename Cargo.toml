@@ -1,7 +1,11 @@
 [package]
 name = "maker"
-version = "0.2.7"
+version = "0.2.11"
 edition = "2024"
+
+[dependencies]
+serde_json = { version = "1", features = ["raw_value"] }
+yaml-rust2 = { version = "0.13", default-features = false }
 
 [profile.release]
 lto = true

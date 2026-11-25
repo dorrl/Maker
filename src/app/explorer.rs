@@ -434,6 +434,9 @@ impl App {
             let language = Language::from_path(&path);
             if doc.language != language {
                 changed_language.push(index);
+                doc.data_view = None;
+            } else if !data_view::supports(language, Some(&path)) {
+                doc.data_view = None;
             }
             doc.label = file_name(&path).into_owned();
             doc.language = language;
@@ -453,7 +456,7 @@ impl App {
             }
         }
         self.rebase_terminal_paths(|path| rebase(path, before, after));
-        self.refresh_tab();
+        self.layout();
     }
 }
 

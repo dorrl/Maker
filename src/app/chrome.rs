@@ -17,6 +17,10 @@ thread_local! {
     static HOVERED_ROW: Cell<Option<(Handle, usize)>> = const { Cell::new(None) };
 }
 
+pub(super) fn row_is_hovered(window: Handle, row: usize) -> bool {
+    HOVERED_ROW.get() == Some((window, row))
+}
+
 fn hover_row(window: Handle, next: Option<usize>) {
     let next = next.map(|row| (window, row));
     let old = HOVERED_ROW.replace(next);
@@ -121,12 +125,19 @@ pub(super) struct Suggestions {
     pub candidates: Vec<text::completion::Candidate>,
 }
 
+const SECOND_TABS: usize = 384;
+const BREADCRUMB: usize = 385;
+const SECOND_BREADCRUMB: usize = 386;
+
 pub(super) struct Chrome {
     pub(super) divider: Handle,
     pub(super) popup: Handle,
     pub(super) tabs: Handle,
-    tab_offset: i32,
-    tab_hover: Option<Point>,
+    second_tabs: Handle,
+    pub(super) breadcrumbs: [Handle; 2],
+    tab_offset: [i32; 2],
+    tab_hover: [Option<Point>; 2],
+    tab_drag: Option<(usize, Point, Option<usize>)>,
     divider_hover: bool,
     scroll_hover: Option<usize>,
     drag: Option<Drag>,
@@ -151,11 +162,14 @@ impl Chrome {
         }
         Ok(Self {
             tabs,
+            second_tabs: surface(SECOND_TABS, WS_TABSTOP)?,
+            breadcrumbs: [surface(BREADCRUMB, 0)?, surface(SECOND_BREADCRUMB, 0)?],
             divider,
             bars,
             popup: surface(POPUP, 0)?,
-            tab_offset: 0,
-            tab_hover: None,
+            tab_offset: [0; 2],
+            tab_hover: [None; 2],
+            tab_drag: None,
             divider_hover: false,
             scroll_hover: None,
             drag: None,
@@ -165,6 +179,20 @@ impl Chrome {
             popup_bounds: Cell::new(None),
             scroll_clips: [(0, Rect::default()); 4],
         })
+    }
+
+    pub(super) fn tab_handle(&self, group: usize) -> Handle {
+        if group == 0 {
+            self.tabs
+        } else {
+            self.second_tabs
+        }
+    }
+
+    pub(super) fn tab_group(&self, handle: Handle) -> Option<usize> {
+        [self.tabs, self.second_tabs]
+            .iter()
+            .position(|&tab| tab == handle)
     }
 
     fn scroll_lit(&self, id: usize) -> bool {
@@ -185,7 +213,10 @@ extern "system" fn surface_proc(window: Handle, message: u32, wp: usize, lp: isi
     let id = unsafe { GetDlgCtrlID(window) } as usize;
     match message {
         WM_PAINT => {
-            if matches!(id, POPUP | TABS) {
+            if matches!(
+                id,
+                POPUP | TABS | SECOND_TABS | BREADCRUMB | SECOND_BREADCRUMB
+            ) {
                 buffered_paint(window, |dc, rect| draw_surface(id, dc, rect));
             } else {
                 paint(window, |dc, rect| draw_surface(id, dc, rect));
@@ -200,8 +231,11 @@ extern "system" fn surface_proc(window: Handle, message: u32, wp: usize, lp: isi
         0x0084 if id == POPUP && with_app(|app| app.chrome.menu.is_none()).unwrap_or(false) => {
             return -1; // HTTRANSPARENT while a dismissed menu finishes its transition.
         }
-        WM_SETCURSOR if id == DIVIDER => {
-            cursor(32644);
+        0x0084 if id == dock::GUIDE => return -1,
+        WM_SETCURSOR if matches!(id, DIVIDER | dock::SPLITTER | dock::SIDEBAR_SPLITTER) => {
+            let stacked = id == dock::SIDEBAR_SPLITTER
+                || id == dock::SPLITTER && with_app(|app| app.dock.stacked).unwrap_or(false);
+            cursor(if stacked { 32645 } else { 32644 });
             return 1;
         }
         WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK
@@ -226,6 +260,14 @@ fn draw_surface(id: usize, dc: Handle, rect: Rect) {
     }
 }
 
+thread_local! {
+    static DELETING_TEXT: Cell<Handle> = const { Cell::new(0) };
+}
+
+pub(super) fn deleting_text(editor: Handle) -> bool {
+    DELETING_TEXT.get() == editor
+}
+
 pub(super) fn watch_control(window: Handle, toolbar: bool) {
     subclass(window, control_proc, usize::from(toolbar));
 }
@@ -241,10 +283,17 @@ extern "system" fn control_proc(
     let parent = unsafe { GetParent(window) };
     if toolbar != 0 {
         button_input(parent, window, message, wp);
+        if matches!(message, WM_MOUSEMOVE | WM_MOUSELEAVE) && wp & 1 == 0 {
+            return 0;
+        }
     }
     let list = toolbar == 0 && unsafe { GetDlgCtrlID(window) } == LIST as i32;
-    let row_list =
-        list || toolbar == 0 && unsafe { GetDlgCtrlID(window) } == git::GRAPH_LIST as i32;
+    let browser_list = toolbar == 0 && unsafe { GetDlgCtrlID(window) } == browser::RESULTS as i32;
+    let data_list = toolbar == 0 && unsafe { GetDlgCtrlID(window) } == data_view::TREE as i32;
+    let row_list = list
+        || browser_list
+        || data_list
+        || toolbar == 0 && unsafe { GetDlgCtrlID(window) } == git::GRAPH_LIST as i32;
     if row_list && message == WM_MOUSEMOVE {
         if HOVERED_ROW.get().is_none_or(|(list, _)| list != window) {
             watch_mouse(window);
@@ -265,6 +314,33 @@ extern "system" fn control_proc(
     } else {
         Vec::new()
     };
+    if (list || browser_list)
+        && message == WM_LBUTTONDBLCLK
+        && let Some(row) = list_at(window, lp)
+        && with_app(|app| app.run_file_row(window, row)).unwrap_or(false)
+    {
+        return 0;
+    }
+    if browser_list && (message == WM_MBUTTONDOWN || message == WM_LBUTTONDOWN && wp & 8 != 0) {
+        if let Some(row) = list_at(window, lp) {
+            select_file_row(window, row);
+            unsafe {
+                SetFocus(window);
+            }
+            with_app(|app| app.post_browser_click(window, row, Point::packed(lp), true));
+        }
+        return 0;
+    }
+    if (list || browser_list)
+        && matches!(
+            message,
+            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEMOVE | WM_CAPTURECHANGED
+        )
+        && with_app(|app| app.list_drag(window, message, wp, lp)).unwrap_or(false)
+    {
+        transition_selection(window, parent, previous);
+        return 0;
+    }
     if list && matches!(message, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK) {
         let modifiers = wp & 0x0c;
         MODIFIED_LIST_CLICK.set(modifiers != 0);
@@ -285,24 +361,42 @@ extern "system" fn control_proc(
     if list && message == WM_LBUTTONUP && MODIFIED_LIST_CLICK.replace(false) {
         return 0;
     }
+    let deletes = toolbar == 0
+        && matches!(
+            (message, wp),
+            (WM_KEYDOWN, 8 | 0x2e) | (0x0102, 8 | 0x7f) | (0x0300 | 0x0303, _)
+        )
+        && unsafe { GetDlgCtrlID(window) } == EDITOR as i32;
+    if matches!(message, 0x0302 | 0x0440)
+        && toolbar == 0
+        && unsafe { GetDlgCtrlID(window) } == EDITOR as i32
+    {
+        with_app(|app| app.invalidate_editor_styles(window));
+    }
+    let previous_delete = if deletes {
+        with_app(App::dismiss_completion);
+        DELETING_TEXT.replace(window)
+    } else {
+        0
+    };
     let result = unsafe { DefSubclassProc(window, message, wp, lp) };
+    if deletes {
+        DELETING_TEXT.set(previous_delete);
+    }
+    if data_list
+        && message == WM_LBUTTONUP
+        && let Some(row) = list_at(window, lp)
+    {
+        unsafe {
+            PostMessageW(parent, data_view::TOGGLE, window as usize, row as isize);
+        }
+    }
     transition_selection(window, parent, previous);
     if list
         && message == WM_LBUTTONUP
         && let Some(item) = list_at(window, lp)
     {
-        let data = send(window, 0x0199, item, 0) as usize;
-        let dpi = PAINT.get().map_or(96, |paint| paint.dpi);
-        let depth = (data >> 8).min(40) as i32;
-        let icon_left = (20 + depth * 14) * dpi / 96;
-        let arrow = if Point::packed(lp).x < icon_left {
-            TREE_ARROW
-        } else {
-            0
-        };
-        unsafe {
-            PostMessageW(parent, EXPLORER_CLICK, item, arrow);
-        }
+        post_explorer_click(parent, window, item, Point::packed(lp));
     }
     if toolbar == 0
         && matches!(
@@ -323,6 +417,17 @@ extern "system" fn control_proc(
         }
     }
     result
+}
+
+pub(super) fn post_explorer_click(parent: Handle, window: Handle, row: usize, point: Point) {
+    let data = send(window, 0x0199, row, 0) as usize;
+    let dpi = PAINT.get().map_or(96, |paint| paint.dpi);
+    let depth = (data >> 8).min(40) as i32;
+    let icon_left = 20 * dpi / 96 + depth * (14 * dpi / 96);
+    let flag = if point.x < icon_left { TREE_ARROW } else { 0 };
+    unsafe {
+        PostMessageW(parent, EXPLORER_CLICK, row, flag);
+    }
 }
 
 pub(super) fn handle_parent_message(message: u32, wp: usize, modifiers: isize) -> bool {
@@ -480,7 +585,10 @@ impl Thumb {
 
 impl App {
     pub(super) fn sync_scrollbars(&mut self) {
-        let second = self.other.map(|index| self.documents[index].editor);
+        let second = self.other.and_then(|index| {
+            let document = &self.documents[index];
+            document.source_visible().then_some(document.editor)
+        });
         let active = self.editor();
         let targets = [
             self.sidebar.then_some(self.list),
@@ -615,7 +723,15 @@ impl App {
 
     fn paint_surface(&self, id: usize, dc: Handle, rect: Rect, palette: Paint) {
         match id {
-            TABS => self.paint_tabs(dc, rect, palette),
+            TABS | SECOND_TABS => {
+                self.paint_tabs(usize::from(id == SECOND_TABS), dc, rect, palette)
+            }
+            BREADCRUMB | SECOND_BREADCRUMB => {
+                self.paint_breadcrumb(usize::from(id == SECOND_BREADCRUMB), dc, rect, palette)
+            }
+            dock::GUIDE | dock::SPLITTER | dock::SIDEBAR_SPLITTER => {
+                self.paint_dock(id, dc, rect, palette)
+            }
             DIVIDER => {
                 let emphasis = motion::value(
                     Key::control(self.chrome.divider, Effect::Hover),
@@ -679,7 +795,10 @@ impl App {
         }
         match id {
             DIVIDER => self.sidebar_mouse(window, message, point),
-            TABS => self.tabs_mouse(message, wp, point),
+            TABS | SECOND_TABS => {
+                self.tabs_mouse(usize::from(id == SECOND_TABS), message, wp, point)
+            }
+            dock::SPLITTER | dock::SIDEBAR_SPLITTER => self.splitter_mouse(window, message, point),
             POPUP => self.menu_mouse(message, wp, point),
             FIRST_SCROLL..=LAST_SCROLL => {
                 let old = self.chrome.scroll_lit(id);
@@ -844,10 +963,12 @@ impl App {
         self.px((letters + 74).clamp(118, 240))
     }
 
-    fn tab_limits(&self, width: i32) -> (i32, i32) {
+    fn tab_limits(&self, group: usize, width: i32) -> (i32, i32) {
+        let width = (width - self.px(32)).max(0);
         let total = self
             .documents
             .iter()
+            .filter(|doc| doc.group == group)
             .map(|doc| self.tab_width(doc))
             .sum::<i32>();
         let viewport = if total > width {
@@ -859,43 +980,60 @@ impl App {
     }
 
     pub(super) fn tab_reveal(&mut self, index: usize) {
-        let (viewport, max) = self.tab_limits(bounds(self.chrome.tabs).width());
-        let Some(document) = self.documents.get(index) else {
+        let Some(doc) = self.documents.get(index) else {
             return;
         };
+        let group = doc.group;
+        let tabs = self.chrome.tab_handle(group);
+        let (viewport, max) = self.tab_limits(group, bounds(tabs).width());
         let begin = self.documents[..index]
             .iter()
+            .filter(|doc| doc.group == group)
             .map(|doc| self.tab_width(doc))
             .sum::<i32>();
-        let end = begin + self.tab_width(document);
-        if begin < self.chrome.tab_offset {
-            self.chrome.tab_offset = begin;
-        } else if end > self.chrome.tab_offset + viewport {
-            self.chrome.tab_offset = end - viewport;
+        let end = begin + self.tab_width(doc);
+        let offset = &mut self.chrome.tab_offset[group];
+        if begin < *offset {
+            *offset = begin;
+        } else if end > *offset + viewport {
+            *offset = end - viewport;
         }
-        self.chrome.tab_offset = self.chrome.tab_offset.clamp(0, max);
-        redraw(self.chrome.tabs);
+        *offset = (*offset).clamp(0, max);
+        repaint(tabs);
     }
 
     pub(super) fn clamp_tab_scroll(&mut self) {
-        let (_, max) = self.tab_limits(bounds(self.chrome.tabs).width());
-        self.chrome.tab_offset = self.chrome.tab_offset.clamp(0, max);
+        for group in 0..2 {
+            let (_, max) = self.tab_limits(group, bounds(self.chrome.tab_handle(group)).width());
+            self.chrome.tab_offset[group] = self.chrome.tab_offset[group].clamp(0, max);
+        }
     }
 
-    fn tab_target(&self, point: Point, viewport: i32) -> Option<(usize, bool)> {
+    pub(super) fn clear_tab_motion(&mut self) {
+        for group in 0..2 {
+            motion::clear(self.chrome.tab_handle(group));
+            self.chrome.tab_hover[group] = None;
+        }
+    }
+
+    fn tab_target(&self, group: usize, point: Point, viewport: i32) -> Option<(usize, bool)> {
         if point.x >= viewport
             || point.x < 0
             || point.y < 0
-            || point.y >= bounds(self.chrome.tabs).height()
+            || point.y >= bounds(self.chrome.tab_handle(group)).height()
         {
             return None;
         }
-        let mut x = -self.chrome.tab_offset;
-        for (index, document) in self.documents.iter().enumerate() {
-            let end = x + self.tab_width(document);
-            if point.x >= x && point.x < end {
-                let close = end <= viewport && point.x >= end - self.px(30);
-                return Some((index, close));
+        let mut x = -self.chrome.tab_offset[group];
+        for (index, doc) in self
+            .documents
+            .iter()
+            .enumerate()
+            .filter(|(_, doc)| doc.group == group)
+        {
+            let end = x + self.tab_width(doc);
+            if (x..end).contains(&point.x) {
+                return Some((index, end <= viewport && point.x >= end - self.px(30)));
             }
             x = end;
         }
@@ -903,17 +1041,19 @@ impl App {
     }
 
     fn tab_cell(&self, index: usize) -> Option<Rect> {
-        let view = bounds(self.chrome.tabs);
-        let (viewport, _) = self.tab_limits(view.width());
-        let document = self.documents.get(index)?;
+        let doc = self.documents.get(index)?;
+        let group = doc.group;
+        let view = bounds(self.chrome.tab_handle(group));
+        let (viewport, _) = self.tab_limits(group, view.width());
         let offset = self.documents[..index]
             .iter()
+            .filter(|doc| doc.group == group)
             .map(|doc| self.tab_width(doc))
             .sum::<i32>()
-            - self.chrome.tab_offset;
+            - self.chrome.tab_offset[group];
         let cell = Rect {
             left: offset.max(0),
-            right: (offset + self.tab_width(document)).min(viewport),
+            right: (offset + self.tab_width(doc)).min(viewport),
             ..view
         };
         (cell.width() > 0).then_some(cell)
@@ -925,10 +1065,14 @@ impl App {
         }
         for index in previous.into_iter().chain(next) {
             if let Some(rect) = self.tab_cell(index) {
+                let group = self.documents[index].group;
+                if Some(index) == previous && self.group_document(group) == Some(index) {
+                    continue;
+                }
                 let selected = Some(index) == next;
                 motion::animate(
                     self.window,
-                    Key::item(self.chrome.tabs, index, Effect::Selected),
+                    Key::item(self.chrome.tab_handle(group), index, Effect::Selected),
                     Area::Rect(rect),
                     !selected,
                     selected,
@@ -937,26 +1081,66 @@ impl App {
         }
     }
 
-    fn paint_tabs(&self, dc: Handle, rect: Rect, palette: Paint) {
+    fn paint_breadcrumb(&self, group: usize, dc: Handle, rect: Rect, palette: Paint) {
+        fill(dc, rect, palette.background);
+        let Some(doc) = self
+            .group_document(group)
+            .map(|index| &self.documents[index])
+        else {
+            return;
+        };
+        let name = if let Some(view) = &doc.browser {
+            view.base().display().to_string()
+        } else if let Some(path) = &doc.path {
+            let shown = self
+                .root
+                .as_ref()
+                .and_then(|root| path.strip_prefix(root).ok())
+                .unwrap_or(path);
+            shown
+                .components()
+                .map(|entry| entry.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("  ›  ")
+        } else {
+            doc.label.clone()
+        };
+        draw_label(
+            dc,
+            Rect {
+                left: self.px(13),
+                right: rect.right - self.px(8),
+                ..rect
+            },
+            &name,
+            palette.font,
+            palette.muted,
+            false,
+        );
+    }
+
+    fn paint_tabs(&self, group: usize, dc: Handle, rect: Rect, palette: Paint) {
+        let tabs = self.chrome.tab_handle(group);
         fill(dc, rect, palette.chrome);
-        let (viewport, maximum) = self.tab_limits(rect.width());
-        let mut start = -self.chrome.tab_offset;
-        let hovered = self
-            .chrome
-            .tab_hover
-            .and_then(|point| self.tab_target(point, viewport));
-        for (index, document) in self.documents.iter().enumerate() {
+        let (viewport, maximum) = self.tab_limits(group, rect.width());
+        let mut start = -self.chrome.tab_offset[group];
+        let hovered =
+            self.chrome.tab_hover[group].and_then(|point| self.tab_target(group, point, viewport));
+        for (index, document) in self
+            .documents
+            .iter()
+            .enumerate()
+            .filter(|(_, doc)| doc.group == group)
+        {
             let end = start + self.tab_width(document);
             if start >= viewport {
                 break;
             }
             if end > 0 {
-                let active = self.active == Some(index);
+                let active = self.group_document(group) == Some(index);
                 let over = hovered.is_some_and(|(tab, _)| tab == index);
-                let selected =
-                    motion::value(Key::item(self.chrome.tabs, index, Effect::Selected), active);
-                let hover =
-                    motion::value(Key::item(self.chrome.tabs, index * 2, Effect::Hover), over);
+                let selected = motion::value(Key::item(tabs, index, Effect::Selected), active);
+                let hover = motion::value(Key::item(tabs, index * 2, Effect::Hover), over);
                 let cell = Rect {
                     left: start.max(0),
                     right: end.min(viewport),
@@ -969,7 +1153,7 @@ impl App {
                     fill_color(
                         dc,
                         Rect {
-                            bottom: rect.top + self.px(2),
+                            top: rect.bottom - self.px(2),
                             ..cell
                         },
                         motion::mix(background, palette.accent, selected),
@@ -1000,7 +1184,7 @@ impl App {
                         motion::mix(
                             palette.muted,
                             palette.foreground,
-                            selected.max(hover * 0.35),
+                            selected.max(0.45 + hover * 0.35),
                         ),
                         false,
                     );
@@ -1013,20 +1197,21 @@ impl App {
                         rect.height() - self.px(10),
                     );
                     let over_close = motion::value(
-                        Key::item(self.chrome.tabs, index * 2 + 1, Effect::Hover),
+                        Key::item(tabs, index * 2 + 1, Effect::Hover),
                         hovered == Some((index, true)),
                     );
                     if over_close > 0.0 {
-                        fill_color(
+                        fill_rounded(
                             dc,
                             close,
+                            self.px(4),
                             motion::mix(background, palette.control_rgb, over_close),
                         );
                     }
                     let visibility = if document.dirty {
                         1.0
                     } else {
-                        selected.max(hover)
+                        selected.max(0.55 + hover * 0.45)
                     };
                     if visibility > 0.0 {
                         draw_label(
@@ -1065,7 +1250,7 @@ impl App {
                     self.px(29),
                     rect.height(),
                 );
-                if self.chrome.tab_hover.is_some_and(|point| cell.has(point)) {
+                if self.chrome.tab_hover[group].is_some_and(|point| cell.has(point)) {
                     fill(dc, cell, palette.control);
                 }
                 draw_label(
@@ -1078,6 +1263,14 @@ impl App {
                 );
             }
         }
+        let new = Rect {
+            left: (rect.right - self.px(32)).max(rect.left),
+            ..rect
+        };
+        if self.chrome.tab_hover[group].is_some_and(|point| new.has(point)) {
+            fill(dc, new, palette.control);
+        }
+        draw_label(dc, new, "+", palette.large_font, palette.foreground, true);
         fill(
             dc,
             Rect {
@@ -1088,21 +1281,77 @@ impl App {
         );
     }
 
-    fn tabs_mouse(&mut self, message: u32, wp: usize, point: Point) {
-        let (viewport, max) = self.tab_limits(bounds(self.chrome.tabs).width());
+    fn tabs_mouse(&mut self, group: usize, message: u32, wp: usize, point: Point) {
+        let tabs = self.chrome.tab_handle(group);
+        let area = bounds(tabs);
+        let (viewport, max) = self.tab_limits(group, area.width());
+        if let Some((index, origin, previous)) = self.chrome.tab_drag {
+            let moved = (point.x - origin.x).abs().max((point.y - origin.y).abs()) >= self.px(7);
+            match message {
+                WM_MOUSEMOVE if moved => {
+                    if area.has(point)
+                        || self.other_tab_at(tabs, point).is_some()
+                        || self.transfer_target(tabs, point).is_some()
+                    {
+                        self.clear_dock();
+                    } else {
+                        let target = self.docking_at(tabs, point, false, false);
+                        self.show_dock(target);
+                    }
+                }
+                WM_LBUTTONUP => {
+                    self.chrome.tab_drag = None;
+                    self.clear_dock();
+                    unsafe {
+                        ReleaseCapture();
+                    }
+                    if moved && index < self.documents.len() {
+                        if area.has(point) {
+                            if let Some((to, _)) = self.tab_target(group, point, viewport) {
+                                self.move_document(index, to);
+                            }
+                        } else if let Some(other_group) = self.other_tab_at(tabs, point) {
+                            self.move_to_group(index, other_group);
+                        } else if let Some(target) = self.transfer_target(tabs, point) {
+                            if let Err(error) = self.move_document_to_window(index, target) {
+                                self.show_error(error);
+                            }
+                        } else {
+                            let target = self.docking_at(tabs, point, false, false);
+                            if target == dock::Destination::Window {
+                                if let Err(error) = self.detach_document(index) {
+                                    self.show_error(error);
+                                }
+                            } else {
+                                self.split_document(index, target, previous);
+                            }
+                        }
+                    }
+                    repaint(tabs);
+                    return;
+                }
+                WM_CAPTURECHANGED => {
+                    self.chrome.tab_drag = None;
+                    self.clear_dock();
+                }
+                _ => {}
+            }
+        }
         match message {
             WM_MOUSEMOVE | WM_MOUSELEAVE => {
                 let target = |point: Point| {
-                    if max > 0 && point.x >= viewport {
-                        (None, Some(point.x >= viewport + self.px(29)))
+                    if point.x >= area.right - self.px(32) {
+                        (None, Some(2))
+                    } else if max > 0 && point.x >= viewport {
+                        (None, Some(i32::from(point.x >= viewport + self.px(29))))
                     } else {
-                        (self.tab_target(point, viewport), None)
+                        (self.tab_target(group, point, viewport), None)
                     }
                 };
                 let next = (message == WM_MOUSEMOVE).then_some(point);
-                let old = self.chrome.tab_hover.map(target);
+                let old = self.chrome.tab_hover[group].map(target);
                 let current = next.map(target);
-                self.chrome.tab_hover = next;
+                self.chrome.tab_hover[group] = next;
                 if old == current {
                     return;
                 }
@@ -1122,7 +1371,7 @@ impl App {
                             let on = Some(index) == to;
                             motion::animate(
                                 self.window,
-                                Key::item(self.chrome.tabs, index * 2 + offset, Effect::Hover),
+                                Key::item(tabs, index * 2 + offset, Effect::Hover),
                                 Area::Rect(rect),
                                 !on,
                                 on,
@@ -1132,41 +1381,85 @@ impl App {
                 }
                 if old.and_then(|hit| hit.1) != current.and_then(|hit| hit.1) {
                     repaint_rect(
-                        self.chrome.tabs,
+                        tabs,
                         Rect {
                             left: viewport,
-                            ..bounds(self.chrome.tabs)
+                            ..bounds(tabs)
                         },
                     );
                 }
                 return;
             }
             WM_MOUSEWHEEL => {
-                motion::clear(self.chrome.tabs);
+                motion::clear(tabs);
                 let delta = (wp >> 16) as i16 as i32;
-                self.chrome.tab_offset = (self.chrome.tab_offset - delta).clamp(0, max);
+                self.chrome.tab_offset[group] =
+                    (self.chrome.tab_offset[group] - delta).clamp(0, max);
             }
             WM_LBUTTONDOWN | WM_MBUTTONDOWN => {
-                if point.x >= viewport && max > 0 {
-                    motion::clear(self.chrome.tabs);
+                if message == WM_LBUTTONDOWN && point.x >= area.right - self.px(32) {
+                    if let Some(index) = self.group_document(group) {
+                        self.activate(index, false);
+                    }
+                    self.command(browser::NEW_TAB);
+                } else if point.x >= viewport && max > 0 {
+                    motion::clear(tabs);
                     let step = self.px(132)
                         * if point.x < viewport + self.px(29) {
                             -1
                         } else {
                             1
                         };
-                    self.chrome.tab_offset = (self.chrome.tab_offset + step).clamp(0, max);
-                } else if let Some((index, close)) = self.tab_target(point, viewport) {
+                    self.chrome.tab_offset[group] =
+                        (self.chrome.tab_offset[group] + step).clamp(0, max);
+                } else if let Some((index, close)) = self.tab_target(group, point, viewport) {
                     if close || message == WM_MBUTTONDOWN {
                         self.close_document(index);
                     } else {
+                        let previous = self.active;
                         self.activate(index, true);
+                        self.chrome.tab_drag = Some((index, point, previous));
+                        unsafe {
+                            SetCapture(tabs);
+                        }
                     }
                 }
             }
             _ => return,
         }
-        repaint(self.chrome.tabs);
+        repaint(tabs);
+    }
+
+    fn other_tab_at(&self, from: Handle, point: Point) -> Option<usize> {
+        let group = 1 - self.chrome.tab_group(from)?;
+        let target = self.chrome.tab_handle(group);
+        (self.other.is_some() && bounds(target).has(map_point(from, target, point)))
+            .then_some(group)
+    }
+
+    fn move_to_group(&mut self, index: usize, group: usize) {
+        let source = self.documents[index].group;
+        let Some(existing) = self.group_document(group) else {
+            return;
+        };
+        if let Some(neighbor) = self
+            .documents
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, doc)| (i != index && doc.group == source).then_some(i))
+        {
+            self.documents[index].group = group;
+            self.active = Some(index);
+            self.active_right = group == 1;
+            self.other = Some(neighbor);
+            self.clear_tab_motion();
+            self.activate(index, true);
+        } else {
+            self.collapse_editor_groups();
+            self.activate(existing, false);
+            self.activate(index, true);
+        }
     }
 
     pub(super) fn open_menu(&mut self, owner: usize, rows: &[(usize, &str)]) {
@@ -2024,7 +2317,7 @@ pub(super) fn paint_file_row(item: &DrawItem, palette: Paint, dpi: i32) {
     }
 }
 
-fn chevron(dc: Handle, center: Point, radius: i32, open: f32, color: u32) {
+pub(super) fn chevron(dc: Handle, center: Point, radius: i32, open: f32, color: u32) {
     let (sin, cos) = (open * std::f32::consts::FRAC_PI_2).sin_cos();
     let point = |x: f32, y: f32| Point {
         x: center.x + ((x * cos - y * sin) * radius as f32).round() as i32,

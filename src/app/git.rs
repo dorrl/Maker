@@ -804,7 +804,7 @@ fn diff_output(mut command: Command, differs_is_ok: bool) -> io::Result<String> 
         bytes.truncate(MAX_DIFF);
         let mut text = String::from_utf8_lossy(&bytes)
             .replace("\r\n", "\n")
-            .replace('\0', "�");
+            .replace('\0', " ");
         if truncated {
             text.push_str("\n… 변경 내용이 길어 일부만 표시했습니다.\n");
         }

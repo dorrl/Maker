@@ -256,8 +256,70 @@ struct TextDocumentVtable {
     query: unsafe extern "system" fn(*mut TextDocument, *const Guid, *mut *mut TextDocument) -> i32,
     add_ref: usize,
     release: unsafe extern "system" fn(*mut TextDocument) -> u32,
-    before_undo: [usize; 19],
+    before_freeze: [usize; 15],
+    freeze: unsafe extern "system" fn(*mut TextDocument, *mut i32) -> i32,
+    unfreeze: unsafe extern "system" fn(*mut TextDocument, *mut i32) -> i32,
+    before_undo: [usize; 2],
     undo: unsafe extern "system" fn(*mut TextDocument, i32, *mut i32) -> i32,
+    redo: usize,
+    range: unsafe extern "system" fn(*mut TextDocument, i32, i32, *mut *mut TomRange) -> i32,
+}
+
+#[repr(C)]
+struct TomRange {
+    vtable: *const TomRangeVtable,
+}
+
+#[repr(C)]
+struct TomRangeVtable {
+    query: usize,
+    add_ref: usize,
+    release: unsafe extern "system" fn(*mut TomRange) -> u32,
+    before_start: [usize; 11],
+    get_start: unsafe extern "system" fn(*mut TomRange, *mut i32) -> i32,
+    before_font: [usize; 3],
+    get_font: unsafe extern "system" fn(*mut TomRange, *mut *mut TomFont) -> i32,
+    before_index: [usize; 7],
+    get_index: unsafe extern "system" fn(*mut TomRange, i32, *mut i32) -> i32,
+    set_index: unsafe extern "system" fn(*mut TomRange, i32, i32, i32) -> i32,
+    set_range: unsafe extern "system" fn(*mut TomRange, i32, i32) -> i32,
+}
+
+#[repr(C)]
+struct TomFont {
+    vtable: *const TomFontVtable,
+}
+
+#[repr(C)]
+struct TomFontVtable {
+    query: usize,
+    add_ref: usize,
+    release: unsafe extern "system" fn(*mut TomFont) -> u32,
+    before_foreground: [usize; 22],
+    set_foreground: unsafe extern "system" fn(*mut TomFont, i32) -> i32,
+}
+
+pub struct RangeColor {
+    range: *mut TomRange,
+    font: *mut TomFont,
+}
+
+impl RangeColor {
+    pub fn set(&self, start: i32, end: i32, color: u32) -> bool {
+        unsafe {
+            ((*(*self.range).vtable).set_range)(self.range, start, end) >= 0
+                && ((*(*self.font).vtable).set_foreground)(self.font, color as i32) >= 0
+        }
+    }
+}
+
+impl Drop for RangeColor {
+    fn drop(&mut self) {
+        unsafe {
+            ((*(*self.font).vtable).release)(self.font);
+            ((*(*self.range).vtable).release)(self.range);
+        }
+    }
 }
 
 #[repr(C)]
@@ -326,7 +388,15 @@ struct FileOperationVtable {
     progress_dialog: usize,
     properties: usize,
     owner: unsafe extern "system" fn(*mut FileOperation, Handle) -> i32,
-    before_delete: [usize; 8],
+    before_copy: [usize; 6],
+    copy: unsafe extern "system" fn(
+        *mut FileOperation,
+        *mut ShellItem,
+        *mut ShellItem,
+        *const u16,
+        *mut c_void,
+    ) -> i32,
+    copy_items: usize,
     delete: unsafe extern "system" fn(*mut FileOperation, *mut ShellItem, *mut c_void) -> i32,
     delete_items: usize,
     new_item: usize,
@@ -346,14 +416,35 @@ struct TextDocument {
     vtable: *const TextDocumentVtable,
 }
 
-pub struct UndoPause(*mut TextDocument);
-impl Drop for UndoPause {
+pub struct FormattingPause {
+    document: *mut TextDocument,
+    frozen: bool,
+}
+
+impl FormattingPause {
+    pub fn range_color(&self) -> Option<RangeColor> {
+        unsafe {
+            let range = tom_range(self.document, 0)?;
+            let mut font = null_mut();
+            if ((*(*range).vtable).get_font)(range, &mut font) != 0 || font.is_null() {
+                ((*(*range).vtable).release)(range);
+                return None;
+            }
+            Some(RangeColor { range, font })
+        }
+    }
+}
+
+impl Drop for FormattingPause {
     fn drop(&mut self) {
         // ITextDocument::Undo(tomResume) resumes normal edit recording.
         unsafe {
-            let table = &*(*self.0).vtable;
-            (table.undo)(self.0, -9999994, null_mut());
-            (table.release)(self.0);
+            let table = &*(*self.document).vtable;
+            (table.undo)(self.document, -9999994, null_mut());
+            if self.frozen {
+                (table.unfreeze)(self.document, &mut 0);
+            }
+            (table.release)(self.document);
         }
     }
 }
@@ -391,6 +482,7 @@ pub type SubclassProc = extern "system" fn(Handle, u32, usize, isize, usize, usi
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    fn GetSystemDirectoryW(buffer: *mut u16, length: u32) -> u32;
     fn GetModuleHandleW(name: *const u16) -> Handle;
     fn LoadLibraryW(name: *const u16) -> Handle;
     fn LoadLibraryExW(name: *const u16, file: Handle, flags: u32) -> Handle;
@@ -434,15 +526,26 @@ unsafe extern "system" {
     fn SetWindowTextW(window: Handle, value: *const u16) -> i32;
     fn GetWindowTextLengthW(window: Handle) -> i32;
     fn GetWindowTextW(window: Handle, text: *mut u16, max: i32) -> i32;
+    fn WindowFromPoint(point: Point) -> Handle;
+    fn GetAncestor(window: Handle, flags: u32) -> Handle;
+    fn GetWindowLongW(window: Handle, index: i32) -> i32;
+    fn SetWindowLongW(window: Handle, index: i32, value: i32) -> i32;
+    fn MonitorFromWindow(window: Handle, flags: u32) -> Handle;
+    fn GetMonitorInfoW(monitor: Handle, info: *mut MonitorInfo) -> i32;
+    pub fn SetForegroundWindow(window: Handle) -> i32;
     pub fn SetFocus(window: Handle) -> Handle;
     pub fn GetFocus() -> Handle;
     fn GetDC(window: Handle) -> Handle;
     fn ReleaseDC(window: Handle, dc: Handle) -> i32;
+    fn GetClipboardSequenceNumber() -> u32;
     fn OpenClipboard(window: Handle) -> i32;
     fn CloseClipboard() -> i32;
     fn EmptyClipboard() -> i32;
+    fn RegisterClipboardFormatW(name: *const u16) -> u32;
     fn GetClipboardData(format: u32) -> Handle;
     fn SetClipboardData(format: u32, handle: Handle) -> Handle;
+    fn GetNextDlgTabItem(window: Handle, control: Handle, previous: i32) -> Handle;
+    pub fn GetDlgItem(window: Handle, id: i32) -> Handle;
     pub fn GetDlgCtrlID(window: Handle) -> i32;
     pub fn GetParent(window: Handle) -> Handle;
     pub fn SetCapture(window: Handle) -> Handle;
@@ -546,6 +649,14 @@ unsafe extern "system" {
 #[link(name = "shell32")]
 unsafe extern "system" {
     pub fn DragAcceptFiles(window: Handle, accept: i32);
+    fn ShellExecuteW(
+        window: Handle,
+        operation: *const u16,
+        file: *const u16,
+        parameters: *const u16,
+        directory: *const u16,
+        show: i32,
+    ) -> Handle;
     fn DragQueryFileW(drop: Handle, index: u32, path: *mut u16, len: u32) -> u32;
     fn DragFinish(drop: Handle);
     fn SHCreateItemFromParsingName(
@@ -663,6 +774,42 @@ pub fn main_window(class: &str) -> io::Result<Handle> {
     }
 }
 
+pub fn tool_window(class: &str, label: &str, parent: Handle, size: Point) -> io::Result<Handle> {
+    let frame = relative_rect(parent, 0);
+    let (class, label) = (wide(class), wide(label));
+    let handle = unsafe {
+        CreateWindowExW(
+            0x80,
+            class.as_ptr(),
+            label.as_ptr(),
+            0x02c80000,
+            frame.left + ((frame.width() - size.x) / 2).max(0),
+            frame.top + ((frame.height() - size.y) / 2).max(0),
+            size.x,
+            size.y,
+            parent,
+            0,
+            GetModuleHandleW(null()),
+            null(),
+        )
+    };
+    if handle == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(handle)
+    }
+}
+
+pub fn next_dialog_control(window: Handle, previous: bool) {
+    unsafe {
+        SetFocus(GetNextDlgTabItem(window, GetFocus(), i32::from(previous)));
+    }
+}
+
+pub fn is_child(parent: Handle, window: Handle) -> bool {
+    parent != 0 && (window == parent || unsafe { GetParent(window) } == parent)
+}
+
 pub fn child(
     parent: Handle,
     id: usize,
@@ -694,13 +841,93 @@ pub fn child(
     }
 }
 
+pub fn system_program(name: &str) -> io::Result<std::path::PathBuf> {
+    let mut buffer = vec![0u16; 32768];
+    let size = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if size == 0 || size >= buffer.len() {
+        return Err(io::Error::last_os_error());
+    }
+    use std::os::windows::ffi::OsStringExt;
+    Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer[..size])).join(name))
+}
+
 pub fn send(window: Handle, message: u32, wp: usize, lp: isize) -> isize {
     unsafe { SendMessageW(window, message, wp, lp) }
 }
 pub fn show(window: Handle, visible: bool) {
     unsafe {
-        ShowWindow(window, if visible { 5 } else { 0 });
+        let shown = GetWindowLongW(window, -16) as u32 & 0x10000000 != 0;
+        if shown != visible {
+            ShowWindow(window, if visible { 8 } else { 0 });
+        }
     }
+}
+
+pub fn window_at(from: Handle, point: Point) -> (Handle, Point) {
+    let screen = map_point(from, 0, point);
+    let target = unsafe { GetAncestor(WindowFromPoint(screen), 2) };
+    (target, map_point(0, target, screen))
+}
+
+#[repr(C)]
+struct MonitorInfo {
+    size: u32,
+    monitor: Rect,
+    work: Rect,
+    flags: u32,
+}
+
+pub fn fullscreen(window: Handle, saved: Option<SavedWindow>) -> bool {
+    const GWL_STYLE: i32 = -16;
+    const FRAME: i32 = 0x00cf0000;
+    unsafe {
+        let style = GetWindowLongW(window, GWL_STYLE);
+        if let Some(saved) = saved {
+            SetWindowLongW(window, GWL_STYLE, style | FRAME);
+            ShowWindow(window, 9);
+            SetWindowPos(
+                window,
+                0,
+                saved.normal.left,
+                saved.normal.top,
+                saved.normal.width(),
+                saved.normal.height(),
+                0x0034,
+            );
+            if saved.maximized {
+                ShowWindow(window, 3);
+            }
+        } else {
+            let mut info = MonitorInfo {
+                size: size_of::<MonitorInfo>() as u32,
+                monitor: Rect::default(),
+                work: Rect::default(),
+                flags: 0,
+            };
+            if GetMonitorInfoW(MonitorFromWindow(window, 2), &mut info) == 0 {
+                return false;
+            }
+            if style & 0x01000000 != 0 {
+                ShowWindow(window, 9);
+            }
+            SetWindowLongW(
+                window,
+                GWL_STYLE,
+                GetWindowLongW(window, GWL_STYLE) & !FRAME,
+            );
+            let rect = info.monitor;
+            SetWindowPos(
+                window,
+                0,
+                rect.left,
+                rect.top,
+                rect.width(),
+                rect.height(),
+                0x0034,
+            );
+        }
+    }
+    true
 }
 
 pub fn window_placement(window: Handle) -> Option<SavedWindow> {
@@ -745,6 +972,11 @@ pub fn show_main_window(window: Handle, maximized: bool) {
 
 pub fn show_overlay(window: Handle, rect: Rect) {
     unsafe {
+        let flags = if relative_rect(window, GetParent(window)) == rect {
+            0x0053
+        } else {
+            0x0050
+        };
         SetWindowPos(
             window,
             0,
@@ -752,7 +984,7 @@ pub fn show_overlay(window: Handle, rect: Rect) {
             rect.top,
             rect.width(),
             rect.height(),
-            0x0050,
+            flags,
         );
     }
 }
@@ -1031,7 +1263,43 @@ pub fn message(window: Handle, body: &str, title: &str, style: u32) -> i32 {
     unsafe { MessageBoxW(window, body.as_ptr(), title.as_ptr(), style) }
 }
 
+pub fn run_application(window: Handle, path: &std::path::Path) -> io::Result<()> {
+    let file = wide(path);
+    let directory = path.parent().map(wide);
+    let result = unsafe {
+        ShellExecuteW(
+            window,
+            wide("open").as_ptr(),
+            file.as_ptr(),
+            null(),
+            directory
+                .as_ref()
+                .map_or(null(), |directory| directory.as_ptr()),
+            1,
+        )
+    };
+    if result <= 32 {
+        Err(io::Error::other(format!(
+            "실행 파일을 열 수 없습니다. ({result})"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 pub fn recycle_paths(window: Handle, paths: &[PathBuf]) -> io::Result<bool> {
+    shell_file_operation(window, paths, None)
+}
+
+pub fn copy_paths(window: Handle, paths: &[PathBuf], folder: &std::path::Path) -> io::Result<bool> {
+    shell_file_operation(window, paths, Some(folder))
+}
+
+fn shell_file_operation(
+    window: Handle,
+    paths: &[PathBuf],
+    folder: Option<&std::path::Path>,
+) -> io::Result<bool> {
     const CLASS: Guid = Guid(
         0x3ad05575,
         0x8857,
@@ -1046,9 +1314,12 @@ pub fn recycle_paths(window: Handle, paths: &[PathBuf]) -> io::Result<bool> {
     );
     let check = |result: i32| {
         if result < 0 {
-            Err(io::Error::other(format!(
-                "휴지통으로 이동할 수 없습니다. ({result:#x})"
-            )))
+            let message = if folder.is_some() {
+                "파일을 복사할 수 없습니다."
+            } else {
+                "휴지통으로 이동할 수 없습니다."
+            };
+            Err(io::Error::other(format!("{message} ({result:#x})")))
         } else {
             Ok(())
         }
@@ -1063,22 +1334,42 @@ pub fn recycle_paths(window: Handle, paths: &[PathBuf]) -> io::Result<bool> {
             (&mut operation as *mut *mut FileOperation).cast(),
         ))?;
         let api = &*(*operation).vtable;
+        let item = |path: &std::path::Path| {
+            let mut item = null_mut();
+            check(SHCreateItemFromParsingName(
+                wide(path).as_ptr(),
+                null_mut(),
+                &SHELL_ITEM_IID,
+                &mut item,
+            ))?;
+            Ok::<_, io::Error>(item)
+        };
         let result = (|| {
             (api.owner)(operation, window);
-            // Keep the Shell's confirmation UI if a volume cannot recycle.
-            check((api.flags)(operation, 0x0008_0000 | 0x0040))?;
-            for path in paths {
-                let mut item = null_mut();
-                check(SHCreateItemFromParsingName(
-                    wide(path).as_ptr(),
-                    null_mut(),
-                    &SHELL_ITEM_IID,
-                    &mut item,
-                ))?;
-                let queued = (api.delete)(operation, item, null_mut());
-                ((*(*item).vtable).release)(item);
-                check(queued)?;
+            let flags = if folder.is_some() {
+                0x0008
+            } else {
+                0x0008_0000 | 0x0040
+            };
+            check((api.flags)(operation, flags))?;
+            let target = folder.map(item).transpose()?;
+            let queued = (|| {
+                for path in paths {
+                    let source = item(path)?;
+                    let result = if let Some(target) = target {
+                        (api.copy)(operation, source, target, null(), null_mut())
+                    } else {
+                        (api.delete)(operation, source, null_mut())
+                    };
+                    ((*(*source).vtable).release)(source);
+                    check(result)?;
+                }
+                Ok::<(), io::Error>(())
+            })();
+            if let Some(target) = target {
+                ((*(*target).vtable).release)(target);
             }
+            queued?;
             check((api.perform)(operation))?;
             let mut aborted = 0;
             check((api.aborted)(operation, &mut aborted))?;
@@ -1136,6 +1427,42 @@ pub fn fill_color(dc: Handle, rect: Rect, color: u32) {
         SetDCBrushColor(dc, color);
     }
     fill(dc, rect, unsafe { GetStockObject(DC_BRUSH) });
+}
+
+pub fn fill_rounded(dc: Handle, rect: Rect, radius: i32, color: u32) {
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn GetStockObject(id: Handle) -> Handle;
+        fn SetDCBrushColor(dc: Handle, color: u32) -> u32;
+        fn RoundRect(
+            dc: Handle,
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+            x: i32,
+            y: i32,
+        ) -> i32;
+    }
+    if rect.width() <= 0 || rect.height() <= 0 {
+        return;
+    }
+    unsafe {
+        let old_pen = SelectObject(dc, GetStockObject(8));
+        let old_brush = SelectObject(dc, GetStockObject(18));
+        SetDCBrushColor(dc, color);
+        RoundRect(
+            dc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            radius * 2,
+            radius * 2,
+        );
+        SelectObject(dc, old_brush);
+        SelectObject(dc, old_pen);
+    }
 }
 
 pub fn stroke_line(dc: Handle, start: Point, end: Point, color: u32) {
@@ -1425,18 +1752,91 @@ pub fn folder_dialog(
     }
 }
 
+pub fn clipboard_sequence() -> u32 {
+    unsafe { GetClipboardSequenceNumber() }
+}
+
+pub fn paths_to_clipboard(window: Handle, paths: &[PathBuf]) -> io::Result<()> {
+    const CF_HDROP: u32 = 15;
+    fn data(format: u32, bytes: &[u8]) -> io::Result<()> {
+        unsafe {
+            let memory = GlobalAlloc(2, bytes.len());
+            if memory != 0 {
+                let dest: *mut u8 = GlobalLock(memory).cast();
+                if !dest.is_null() {
+                    dest.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len());
+                    GlobalUnlock(memory);
+                    if SetClipboardData(format, memory) != 0 {
+                        return Ok(());
+                    }
+                }
+                GlobalFree(memory);
+            }
+            Err(io::Error::last_os_error())
+        }
+    }
+    let mut buffer: Vec<u8> = [20u32, 0, 0, 0, 1]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    for path in paths {
+        buffer.extend(wide(path).into_iter().flat_map(u16::to_le_bytes));
+    }
+    buffer.extend_from_slice(&[0, 0]);
+    unsafe {
+        if OpenClipboard(window) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let result = if EmptyClipboard() != 0 {
+            data(CF_HDROP, &buffer)
+        } else {
+            Err(io::Error::last_os_error())
+        };
+        if result.is_ok() {
+            let copy = RegisterClipboardFormatW(wide("Preferred DropEffect").as_ptr());
+            if copy != 0 {
+                let _ = data(copy, &1u32.to_le_bytes());
+            }
+        }
+        CloseClipboard();
+        result
+    }
+}
+
+pub fn clipboard_paths(window: Handle) -> io::Result<Vec<PathBuf>> {
+    unsafe {
+        if OpenClipboard(window) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let data = GetClipboardData(15);
+        let paths = if data != 0 {
+            file_drop_paths(data)
+        } else {
+            Vec::new()
+        };
+        CloseClipboard();
+        Ok(paths)
+    }
+}
+
 pub fn dropped_files(handle: Handle) -> Vec<PathBuf> {
+    let files = file_drop_paths(handle);
+    unsafe {
+        DragFinish(handle);
+    }
+    files
+}
+
+fn file_drop_paths(handle: Handle) -> Vec<PathBuf> {
     let count = unsafe { DragQueryFileW(handle, u32::MAX, null_mut(), 0) };
-    let files = (0..count)
+    (0..count)
         .map(|index| {
             let size = unsafe { DragQueryFileW(handle, index, null_mut(), 0) } + 1;
             let mut path = vec![0u16; size as usize];
             let len = unsafe { DragQueryFileW(handle, index, path.as_mut_ptr(), size) };
             PathBuf::from(OsString::from_wide(&path[..len as usize]))
         })
-        .collect();
-    unsafe { DragFinish(handle) };
-    files
+        .collect()
 }
 
 pub fn selection(window: Handle) -> Selection {
@@ -1522,7 +1922,7 @@ pub fn selection_foreground(window: Handle) -> u32 {
     format.color
 }
 
-pub fn without_undo(window: Handle) -> Option<UndoPause> {
+fn text_document(window: Handle) -> Option<*mut TextDocument> {
     const IID: Guid = Guid(
         0x8cc497c0,
         0xa1df,
@@ -1543,11 +1943,49 @@ pub fn without_undo(window: Handle) -> Option<UndoPause> {
         if queried < 0 || doc.is_null() {
             return None;
         }
+        Some(doc)
+    }
+}
+
+unsafe fn tom_range(document: *mut TextDocument, position: i32) -> Option<*mut TomRange> {
+    let mut range = null_mut();
+    let status = unsafe { ((*(*document).vtable).range)(document, position, position, &mut range) };
+    (status == 0 && !range.is_null()).then_some(range)
+}
+
+pub fn editor_paragraph(window: Handle, position: i32) -> Option<(usize, i32)> {
+    const TOM_PARAGRAPH: i32 = 4;
+    const TOM_MOVE: i32 = 0;
+    let document = text_document(window)?;
+    unsafe {
+        let range = tom_range(document, position);
+        ((*(*document).vtable).release)(document);
+        let range = range?;
+        let table = &*(*range).vtable;
+        let mut index = 0;
+        let mut start = 0;
+        let ok = (table.get_index)(range, TOM_PARAGRAPH, &mut index) == 0
+            && index > 0
+            && (table.set_index)(range, TOM_PARAGRAPH, index, TOM_MOVE) == 0
+            && (table.get_start)(range, &mut start) == 0
+            && start <= position;
+        (table.release)(range);
+        ok.then(|| (index as usize - 1, start))
+    }
+}
+
+pub fn pause_formatting(window: Handle) -> Option<FormattingPause> {
+    let doc = text_document(window)?;
+    unsafe {
         let table = &*(*doc).vtable;
         if (table.undo)(doc, -9999995, null_mut()) < 0 {
             (table.release)(doc);
             return None;
         }
-        Some(UndoPause(doc))
+        let frozen = (table.freeze)(doc, &mut 0) == 0;
+        Some(FormattingPause {
+            document: doc,
+            frozen,
+        })
     }
 }

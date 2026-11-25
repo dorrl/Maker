@@ -1,8 +1,14 @@
 mod archive;
+mod browser;
 mod chrome;
+mod data_view;
+mod dock;
 mod explorer;
+mod file_actions;
 mod git;
+mod highlight;
 mod motion;
+mod preferences;
 mod session;
 mod terminal;
 
@@ -36,6 +42,7 @@ const LIST: usize = 302;
 const QUERY: usize = 303;
 const REPLACEMENT: usize = 304;
 const GUTTER: usize = 305;
+const OTHER_GUTTER: usize = 387;
 const ACTION: usize = 306;
 const SECOND: usize = 307;
 const THIRD: usize = 308;
@@ -83,6 +90,7 @@ const FILE_MENU: usize = 129;
 const EDIT_MENU: usize = 130;
 const DOCK_SIDEBAR: usize = 131;
 const COLLAPSE_FOLDERS: usize = 132;
+const FULLSCREEN: usize = 133;
 const SIDEBAR_TITLE: usize = 312;
 const STATUS: usize = 313;
 const LOCATION: usize = 314;
@@ -260,20 +268,36 @@ impl Mode {
 
 struct Document {
     editor: Handle,
+    group: usize,
+    revision: u64,
     path: Option<PathBuf>,
     label: String,
     encoding: Encoding,
     language: Language,
     dirty: bool,
-    colored: bool,
+    highlighting: Option<highlight::Highlighting>,
+    highlight_pending: bool,
     colored_view: Option<Selection>,
     git_diff: Option<(PathBuf, bool)>,
     archive_member: Option<(PathBuf, PathBuf)>,
+    browser: Option<browser::Browser>,
+    response: bool,
+    data_view: Option<data_view::View>,
 }
 
 impl Document {
+    fn data_mode(&self) -> data_view::ViewMode {
+        self.data_view
+            .as_ref()
+            .map_or(data_view::ViewMode::Raw, data_view::View::mode)
+    }
+
+    fn source_visible(&self) -> bool {
+        self.browser.is_none() && self.data_mode() == data_view::ViewMode::Raw
+    }
+
     fn is_preview(&self) -> bool {
-        self.git_diff.is_some() || self.archive_member.is_some()
+        self.git_diff.is_some() || self.archive_member.is_some() || self.response
     }
 }
 
@@ -324,13 +348,18 @@ impl Drop for Search {
 struct App {
     window: Handle,
     toolbar: Vec<(Handle, i32)>,
+    data_buttons: [[Handle; 3]; 2],
     chrome: chrome::Chrome,
+    dock: dock::Dock,
+    secondary_browser: Option<browser::Browser>,
+    detached: bool,
     terminal: terminal::Panel,
     explorer: explorer::Explorer,
     git: git::Panel,
     sidebar_title: Handle,
     list: Handle,
     gutter: Handle,
+    other_gutter: Handle,
     status: Handle,
     location: Handle,
     mode_label: Handle,
@@ -347,6 +376,7 @@ struct App {
     active: Option<usize>,
     other: Option<usize>,
     active_right: bool,
+    window_title: RefCell<String>,
     untitled: usize,
     recently_closed: Vec<PathBuf>,
     root: Option<PathBuf>,
@@ -365,6 +395,9 @@ struct App {
     settings: Settings,
     pending_chord: bool,
     fresh_window: bool,
+    fullscreen: Option<SavedWindow>,
+    preferences_window: Handle,
+    recent_file_list: Handle,
     dpi: i32,
 }
 
@@ -373,6 +406,7 @@ pub fn run() -> io::Result<()> {
     setup(WINDOW_CLASS, window_proc)?;
     chrome::register()?;
     terminal::register()?;
+    preferences::register()?;
     let window = main_window(WINDOW_CLASS)?;
     let mut app = App::new(window)?;
     let mut args = std::env::args_os().skip(1).peekable();
@@ -384,14 +418,29 @@ pub fn run() -> io::Result<()> {
         app.open_paths(paths);
         false
     };
+    let result = run_window(app, maximized);
+    dock::wait_for_windows();
+    result
+}
+
+fn run_window(mut app: App, maximized: bool) -> io::Result<()> {
+    let window = app.window;
+    let _registration = app.dock.register(window);
+    let restore_fullscreen = app.fullscreen.is_some();
+    let terminal_only = app.detached && app.terminal.visible && app.documents.is_empty();
     app.layout();
     APP.with_borrow_mut(|slot| *slot = Some(app));
     show_main_window(window, maximized);
+    if restore_fullscreen {
+        fullscreen(window, None);
+    }
     unsafe {
         UpdateWindow(window);
     }
-    APP.with_borrow(|app| {
-        if let Some(app) = app.as_ref() {
+    with_app(|app| {
+        if terminal_only {
+            app.focus_terminal();
+        } else {
             app.focus_editor();
         }
     });
@@ -425,7 +474,14 @@ pub fn run() -> io::Result<()> {
             });
         }
         let used = if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
-            with_app(|app| app.keyboard(message.window, message.wparam as i32)).unwrap_or(false)
+            with_app(|app| {
+                if preferences::has_focus(app.preferences_window, message.window) {
+                    preferences::keyboard(app.preferences_window, message.wparam as i32)
+                } else {
+                    app.keyboard(message.window, message.wparam as i32)
+                }
+            })
+            .unwrap_or(false)
         } else {
             false
         };
@@ -456,6 +512,40 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
         return 0;
     }
     match message {
+        data_view::READY => {
+            with_app(|app| app.complete_data_view(wp as Handle));
+            return 0;
+        }
+        data_view::TOGGLE => {
+            with_app(|app| app.toggle_data_row(wp as Handle, lp as usize));
+            return 0;
+        }
+        dock::WINDOW_DROP => {
+            with_app(App::receive_window_drops);
+            return 0;
+        }
+        dock::WINDOW_RECEIPT => {
+            with_app(|app| app.finish_window_move(wp as Handle, lp != 0));
+            return 0;
+        }
+        browser::SEARCH_READY => {
+            with_app(|app| app.complete_browser_search(wp as Handle));
+            return 0;
+        }
+        browser::HTTP_READY => {
+            with_app(|app| app.complete_http(wp as Handle));
+            return 0;
+        }
+        browser::SELECT => {
+            with_app(|app| {
+                if let Err(error) =
+                    app.browse_row(wp as Handle, lp as usize >> 2, lp & 2 != 0, lp & 1 != 0)
+                {
+                    app.show_error(error);
+                }
+            });
+            return 0;
+        }
         git::READY => {
             with_app(App::git_tick);
             return 0;
@@ -529,6 +619,7 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                 VIEWPORT_TIMER => app.repaint_viewport(),
                 COMPLETION_TIMER => app.tick_completion(),
                 SEARCH_TIMER => app.check_search(),
+                browser::TIMER => app.start_browser_searches(),
                 terminal::TIMER => app.terminal_tick(),
                 archive::TIMER => app.archive_tick(),
                 session::TIMER => {
@@ -544,13 +635,16 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
             with_app(|app| app.open_paths(paths));
             return 0;
         }
-        WM_ERASEBKGND => {
-            if let Some(palette) = PAINT.get() {
-                let rect = bounds(window);
+        WM_ERASEBKGND => return 1,
+        WM_PAINT => {
+            buffered_paint(window, |dc, rect| {
+                let Some(palette) = PAINT.get() else {
+                    return;
+                };
                 let px = |n| n * palette.dpi / 96;
-                fill(wp as Handle, rect, palette.background);
+                fill(dc, rect, palette.background);
                 fill(
-                    wp as Handle,
+                    dc,
                     Rect {
                         bottom: px(34),
                         ..rect
@@ -558,7 +652,7 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                     palette.chrome,
                 );
                 fill(
-                    wp as Handle,
+                    dc,
                     Rect {
                         top: px(33),
                         bottom: px(34),
@@ -568,7 +662,7 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                 );
                 let bottom = (rect.bottom - px(26)).max(0);
                 fill(
-                    wp as Handle,
+                    dc,
                     Rect {
                         top: bottom,
                         ..rect
@@ -576,7 +670,7 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                     palette.chrome,
                 );
                 fill(
-                    wp as Handle,
+                    dc,
                     Rect {
                         top: bottom,
                         bottom: bottom + 1,
@@ -593,22 +687,23 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                             0
                         };
                         fill(
-                            wp as Handle,
+                            dc,
                             Rect::from_size(left, px(34), side, bottom - px(34)),
                             palette.panel,
                         );
                     }
                 });
-                return 1;
-            }
+            });
+            return 0;
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORLISTBOX | WM_CTLCOLOREDIT => {
             if let Some(palette) = PAINT.get() {
                 let id = unsafe { GetDlgCtrlID(lp) } as usize;
                 let (brush, background, foreground) = match id {
-                    SIDEBAR_TITLE | LIST | git::GRAPH_LIST => {
+                    SIDEBAR_TITLE | LIST | git::GRAPH_LIST | browser::RESULTS => {
                         (palette.panel, palette.panel_rgb, palette.foreground)
                     }
+                    browser::QUERY_ID => (palette.control, palette.control_rgb, palette.foreground),
                     STATUS | LOCATION => (palette.chrome, palette.chrome_rgb, palette.muted),
                     _ => (palette.background, palette.editor_rgb, palette.foreground),
                 };
@@ -623,6 +718,12 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
             if let Some(palette) = PAINT.get() {
                 let item = unsafe { &*(lp as *const DrawItem) };
                 match item.id as usize {
+                    data_view::TREE => with_app(|app| app.paint_data_row(item, palette))
+                        .unwrap_or_else(|| fill(item.dc, item.rect, palette.background)),
+                    browser::RESULTS => chrome::paint_file_row(item, palette, palette.dpi),
+                    browser::FIELD_FRAME | browser::HERO => {
+                        with_app(|app| app.paint_browser(item, palette));
+                    }
                     explorer::NEW_FILE | explorer::NEW_FOLDER => {
                         explorer::paint_button(item, palette)
                     }
@@ -683,22 +784,46 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                     git::GRAPH_LIST => {
                         with_app(|app| app.paint_graph_row(item, palette));
                     }
-                    GUTTER => {
+                    GUTTER | OTHER_GUTTER => {
                         with_app(|app| app.paint_gutter(item, palette));
                     }
                     id => {
                         let toolbar = BUTTONS.iter().any(|button| button.0 == id);
-                        let active = with_app(|app| app.menu_owner() == Some(id)).unwrap_or(false);
+                        let mode = (data_view::FIRST_MODE..=data_view::LAST_MODE).contains(&id);
+                        let active = with_app(|app| {
+                            if mode {
+                                app.data_mode_selected(id)
+                            } else {
+                                app.menu_owner() == Some(id)
+                            }
+                        })
+                        .unwrap_or(false);
                         let base = if toolbar {
                             palette.chrome_rgb
                         } else {
                             palette.control_rgb
                         };
-                        fill_color(
-                            item.dc,
-                            item.rect,
-                            chrome::button_tint(item, palette, base, active),
-                        );
+                        let tint = chrome::button_tint(item, palette, base, active);
+                        if toolbar
+                            || mode
+                            || matches!(
+                                id,
+                                browser::WORK_FOLDER | browser::OPEN_FILE | browser::RECENT_FILE
+                            )
+                        {
+                            fill(
+                                item.dc,
+                                item.rect,
+                                if toolbar {
+                                    palette.chrome
+                                } else {
+                                    palette.background
+                                },
+                            );
+                            fill_rounded(item.dc, item.rect, (5 * palette.dpi / 96).max(1), tint);
+                        } else {
+                            fill_color(item.dc, item.rect, tint);
+                        }
                         draw_label(
                             item.dc,
                             item.rect,
@@ -753,7 +878,11 @@ impl App {
         let mut app = Self {
             window,
             toolbar,
+            data_buttons: data_view::pane_buttons(window)?,
             chrome: chrome::Chrome::new(window)?,
+            dock: dock::Dock::new(window)?,
+            secondary_browser: None,
+            detached: false,
             terminal: terminal::Panel::new(window)?,
             explorer: explorer::Explorer::new(window)?,
             git: git::Panel::new(window)?,
@@ -773,6 +902,7 @@ impl App {
                     | WS_VSCROLL,
             )?,
             gutter: child(window, GUTTER, "STATIC", "", 0xd)?,
+            other_gutter: child(window, OTHER_GUTTER, "STATIC", "", 0xd)?,
             status: static_label(STATUS, "파일을 열거나 작업 폴더를 선택하세요.")?,
             location: static_label(LOCATION, "")?,
             mode_label: static_label(0, "")?,
@@ -793,6 +923,7 @@ impl App {
             active: None,
             other: None,
             active_right: false,
+            window_title: RefCell::new("Maker".into()),
             untitled: 0,
             recently_closed: Vec::new(),
             root: None,
@@ -811,6 +942,9 @@ impl App {
             settings: Settings::load(),
             pending_chord: false,
             fresh_window: false,
+            fullscreen: None,
+            preferences_window: 0,
+            recent_file_list: 0,
             dpi: unsafe { GetDpiForWindow(window) }.max(96) as i32,
         };
         unsafe {
@@ -890,13 +1024,40 @@ impl App {
         let sidebar_content = Rect::from_size(content_left, top, content_width, bottom - top);
         let list_top = self.layout_git_controls(sidebar_content, bar);
         let changes_bottom = self.layout_git_graph(sidebar_content, list_top);
+        self.dock.sidebar_area =
+            Rect::from_size(content_left, list_top, content_width, bottom - list_top);
+        let sidebar_middle = list_top + (bottom - list_top) * self.dock.sidebar_ratio / 100;
+        let can_split_sidebar = self.sidebar && !self.git.open && bottom - list_top >= self.px(120);
+        self.dock.sidebar = if can_split_sidebar {
+            Rect::from_size(
+                content_left,
+                sidebar_middle,
+                content_width,
+                bottom - sidebar_middle,
+            )
+        } else {
+            Rect::default()
+        };
+        let sidebar_split = can_split_sidebar && self.secondary_browser.is_some();
         place(
             self.list,
             content_left,
             list_top,
             content_width,
-            changes_bottom - list_top,
+            if sidebar_split {
+                sidebar_middle - list_top
+            } else {
+                changes_bottom - list_top
+            },
         );
+        place(
+            self.dock.sidebar_splitter,
+            content_left,
+            sidebar_middle,
+            content_width,
+            step,
+        );
+        show(self.dock.sidebar_splitter, sidebar_split);
         show(self.sidebar_title, self.sidebar);
         show(self.list, self.sidebar);
         self.layout_explorer_buttons(Rect::from_size(content_left, top, content_width, bar));
@@ -915,60 +1076,73 @@ impl App {
             editor_width,
             bottom - top,
         ));
-        let (editor_left, editor_width) = (editor_area.left, editor_area.width());
-        place(self.chrome.tabs, editor_left, top, editor_width, bar);
-        self.clamp_tab_scroll();
-        show(self.chrome.tabs, true);
-        let gutter_width = if self.settings.wrap { 0 } else { self.px(49) };
-        let editor_top = top + bar;
-        let editor_height = editor_area.bottom - editor_top;
-        self.layout_welcome(Rect::from_size(
-            editor_left,
-            editor_top,
-            editor_width,
-            editor_height,
-        ));
+        self.dock.area = editor_area;
         let split = self.other.is_some();
-        let first_width = if split {
-            (editor_width - step).max(0) / 2
-        } else {
-            editor_width
-        };
-        let second_start = editor_left + first_width + step;
-        let gutter_left = if self.active_right {
-            second_start
-        } else {
-            editor_left
-        };
+        let (first, second, splitter) = self.dock.panes(step);
         place(
-            self.gutter,
-            gutter_left,
-            editor_top,
-            gutter_width,
-            editor_height,
+            self.dock.splitter,
+            splitter.left,
+            splitter.top,
+            splitter.width(),
+            splitter.height(),
         );
-        show(self.gutter, gutter_width > 0 && self.active.is_some());
+        show(self.dock.splitter, split);
+        for (group, pane) in [if split { first } else { editor_area }, second]
+            .into_iter()
+            .enumerate()
+        {
+            let visible = pane.width() > 0 && pane.height() >= bar && (group == 0 || split);
+            let tabs = self.chrome.tab_handle(group);
+            let breadcrumb = self.chrome.breadcrumbs[group];
+            place(tabs, pane.left, pane.top, pane.width(), bar);
+            let breadcrumb_rect =
+                Rect::from_size(pane.left, pane.top + bar, pane.width(), self.px(23));
+            let breadcrumb_width = self.layout_data_buttons(group, breadcrumb_rect, visible);
+            place(
+                breadcrumb,
+                pane.left,
+                pane.top + bar,
+                breadcrumb_width,
+                self.px(23),
+            );
+            show(tabs, visible);
+            show(breadcrumb, visible && self.group_document(group).is_some());
+        }
+        self.clamp_tab_scroll();
+        self.layout_welcome(self.pane_content(0));
+        for (group, gutter) in [self.gutter, self.other_gutter].into_iter().enumerate() {
+            let pane = self.pane_content(group);
+            let has_editor = self
+                .group_document(group)
+                .is_some_and(|i| self.documents[i].source_visible());
+            place(gutter, pane.left, pane.top, self.px(49), pane.height());
+            show(
+                gutter,
+                !self.settings.wrap && has_editor && pane.height() > 0,
+            );
+        }
         for (index, document) in self.documents.iter().enumerate() {
-            let active = self.active == Some(index);
-            let other = self.other == Some(index);
-            show(document.editor, active || other);
-            if active || other {
-                let right = split && self.active_right == active;
-                let (left, pane_width) = if right {
-                    (second_start, editor_width - first_width - step)
+            let visible =
+                Some(index) == self.group_document(document.group) && document.source_visible();
+            if visible {
+                let pane = self.pane_content(document.group);
+                let inset = if self.settings.wrap {
+                    0
                 } else {
-                    (editor_left, first_width)
+                    self.px(49).min(pane.width())
                 };
-                let inset = if active { gutter_width } else { 0 };
                 place(
                     document.editor,
-                    left + inset,
-                    editor_top,
-                    pane_width - inset,
-                    editor_height,
+                    pane.left + inset,
+                    pane.top,
+                    pane.width() - inset,
+                    pane.height(),
                 );
             }
+            show(document.editor, visible);
         }
+        self.layout_browsers();
+        self.layout_data_panels();
         let location_width = self.px(244).min(width / 2);
         let margin = self.px(10);
         place(
@@ -991,9 +1165,38 @@ impl App {
         self.layout_explorer_edit();
         self.layout_input(width, bar + step);
         self.position_menu();
-        redraw(self.chrome.tabs);
-        redraw(self.gutter);
-        redraw(self.window);
+        self.refresh_tab();
+        repaint(self.gutter);
+        repaint(self.other_gutter);
+        repaint(self.window);
+    }
+
+    fn group_document(&self, group: usize) -> Option<usize> {
+        if group == usize::from(self.active_right) {
+            self.active
+        } else {
+            self.other
+        }
+    }
+
+    fn pane_content(&self, group: usize) -> Rect {
+        let (first, second, _) = self.dock.panes(self.px(6));
+        let pane = if self.other.is_none() {
+            self.dock.area
+        } else if group == 0 {
+            first
+        } else {
+            second
+        };
+        let header = self.px(if self.group_document(group).is_some() {
+            57
+        } else {
+            34
+        });
+        Rect {
+            top: (pane.top + header).min(pane.bottom),
+            ..pane
+        }
     }
 
     fn layout_welcome(&self, area: Rect) {
@@ -1160,7 +1363,12 @@ impl App {
         );
         send(self.list, LB_SETITEMHEIGHT, 0, self.px(24) as isize);
         let previous = PAINT.replace(Some(paint));
-        for control in self.git.controls() {
+        for control in self
+            .git
+            .controls()
+            .into_iter()
+            .chain(self.data_buttons.into_iter().flatten())
+        {
             set_font(control, paint.font);
             repaint(control);
         }
@@ -1192,7 +1400,17 @@ impl App {
             old.release();
         }
         for index in 0..self.documents.len() {
-            self.format(index, true);
+            if let Some(data) = &self.documents[index].data_view {
+                data.apply_style(&self.settings);
+            }
+            if let Some(view) = &self.documents[index].browser {
+                view.apply_font();
+            } else {
+                self.format(index, true);
+            }
+        }
+        if let Some(view) = &self.secondary_browser {
+            view.apply_font();
         }
         self.layout();
         redraw(self.window);
@@ -1205,10 +1423,35 @@ impl App {
         report_error(self.window, &error.to_string());
     }
     fn editor(&self) -> Option<Handle> {
-        self.active.map(|index| self.documents[index].editor)
+        self.active.and_then(|index| {
+            let doc = &self.documents[index];
+            doc.source_visible().then_some(doc.editor)
+        })
     }
     fn focus_editor(&self) {
-        let target = self.editor().unwrap_or(self.welcome_actions[0]);
+        let target = self
+            .active
+            .and_then(|index| {
+                self.documents[index]
+                    .browser
+                    .as_ref()
+                    .map(|view| view.query)
+            })
+            .or_else(|| {
+                self.active.and_then(|index| {
+                    let doc = &self.documents[index];
+                    let mode = doc.data_mode();
+                    if mode == data_view::ViewMode::Raw {
+                        return None;
+                    }
+                    doc.data_view
+                        .as_ref()
+                        .and_then(data_view::View::focus)
+                        .or(Some(self.data_buttons[doc.group][mode as usize]))
+                })
+            })
+            .or_else(|| self.editor())
+            .unwrap_or(self.welcome_actions[0]);
         unsafe {
             SetFocus(target);
         }
@@ -1265,15 +1508,21 @@ impl App {
         let index = self.documents.len();
         self.documents.push(Document {
             editor,
+            group: usize::from(self.active_right),
+            revision: 0,
             path,
             label,
             encoding,
             language,
             dirty: false,
-            colored: false,
+            highlighting: None,
+            highlight_pending: false,
             colored_view: None,
             git_diff: None,
             archive_member: None,
+            browser: None,
+            response: false,
+            data_view: None,
         });
         self.format(index, true);
         self.activate(index, true);
@@ -1329,12 +1578,15 @@ impl App {
         if self.showing_issues && self.active != Some(index) {
             self.show_files("");
         }
-        if self.other == Some(index) {
+        if self.other.is_some() && self.documents[index].group != usize::from(self.active_right) {
             self.other = self.active;
-            self.active_right = self.other.is_some() && !self.active_right;
+            self.active_right = !self.active_right;
         }
         self.active = Some(index);
         self.layout();
+        if self.documents[index].highlight_pending {
+            self.queue_highlight();
+        }
         self.tab_reveal(index);
         self.animate_editor_tabs(previous, Some(index));
         self.update_status();
@@ -1345,17 +1597,51 @@ impl App {
     }
 
     fn refresh_tab(&self) {
-        redraw(self.chrome.tabs);
+        for group in 0..2 {
+            repaint(self.chrome.tab_handle(group));
+            repaint(self.chrome.breadcrumbs[group]);
+        }
     }
 
     fn update_status(&self) {
-        let Some(index) = self.active else {
+        let label = if let Some(document) = self.active.map(|index| &self.documents[index]) {
+            if let Some(view) = &document.browser {
+                title(self.location, &view.base().display().to_string());
+            } else if document.data_mode() != data_view::ViewMode::Raw {
+                let mode = if document.data_mode() == data_view::ViewMode::Pretty {
+                    "Pretty Print"
+                } else {
+                    "트리"
+                };
+                title(
+                    self.location,
+                    &format!("{} · {mode}", document.language.label()),
+                );
+            } else {
+                self.update_caret_status();
+            }
+            format!(
+                "{}{} - Maker",
+                if document.dirty { "● " } else { "" },
+                document.label
+            )
+        } else {
             title(self.location, "");
-            title(self.window, "Maker");
+            "Maker".to_owned()
+        };
+        let mut current = self.window_title.borrow_mut();
+        if *current != label {
+            title(self.window, &label);
+            *current = label;
+        }
+    }
+
+    fn update_caret_status(&self) {
+        let Some(editor) = self.editor() else {
             return;
         };
-        let document = &self.documents[index];
-        let (line, column) = caret_position(document.editor, self.settings.wrap);
+        let document = &self.documents[self.active.unwrap()];
+        let (line, column) = caret_position(editor, self.settings.wrap);
         let newline = if document.encoding.crlf { "CRLF" } else { "LF" };
         title(
             self.location,
@@ -1365,15 +1651,6 @@ impl App {
                 document.language.label()
             ),
         );
-        title(
-            self.window,
-            &format!(
-                "{}{} — Maker",
-                if document.dirty { "● " } else { "" },
-                document.label
-            ),
-        );
-        redraw(self.gutter);
     }
 
     fn format(&mut self, index: usize, full: bool) {
@@ -1431,58 +1708,88 @@ impl App {
                 end: to.min(from.saturating_add(HIGHLIGHT_WINDOW)).min(limit),
             }
         });
-        if !full && region.is_some() && region == document.colored_view {
+        let current_view = document.colored_view;
+        if !full && !document.highlight_pending && region == current_view {
             return;
         }
-        let Some(hold) = without_undo(editor) else {
+        // A viewport move by itself may leave styled text elsewhere in the editor.
+        let same_start = region.map(|range| range.start) == current_view.map(|range| range.start);
+        let previous = document
+            .highlighting
+            .as_ref()
+            .filter(|_| !full && same_start && document.highlight_pending);
+        let next = (document.language != Language::Plain).then(|| {
+            let code = region.map_or_else(
+                || editor_text(editor),
+                |range| editor_range(editor, range.start, range.end),
+            );
+            highlight::Highlighting::new(code, document.language)
+        });
+        let reset = full || previous.is_none();
+        let offset = region.map_or(0, |range| range.start);
+        let mut runs = next
+            .as_ref()
+            .into_iter()
+            .flat_map(|next| next.runs(previous))
+            .filter(|(_, color)| !reset || color.is_some())
+            .peekable();
+        if !reset && runs.peek().is_none() {
+            drop(runs);
+            document.highlighting = next;
+            document.colored_view = region;
+            document.highlight_pending = false;
+            return;
+        }
+        let Some(hold) = pause_formatting(editor) else {
             return;
         };
         let saved_selection = selection(editor);
         let modified = send(editor, EM_GETMODIFY, 0, 0);
         let mut scroll = Point::default();
         send(editor, EM_GETSCROLLPOS, 0, &mut scroll as *mut _ as isize);
-        painting(editor, false);
+        let visible = unsafe { IsWindowVisible(editor) } != 0;
+        if visible {
+            painting(editor, false);
+        }
         let base = PAINT.get().expect("paint has been initialized").foreground;
-        if full || (!viewport && (document.colored || document.colored_view.is_some())) {
+        let range_color = hold.range_color();
+        let set_color = |start, end, color| {
+            if !range_color
+                .as_ref()
+                .is_some_and(|target| target.set(start, end, color))
+            {
+                select(editor, start, end);
+                char_format(editor, 1, color, None);
+            }
+        };
+        if full || reset && region.is_none() {
             let font = full.then_some((self.settings.font.as_str(), self.settings.points));
             char_format(editor, 4, base, font);
             char_format(editor, 0, base, font);
+        } else if reset && let Some(range) = region {
+            set_color(range.start, range.end, base);
         }
-        document.colored = false;
-        document.colored_view = region;
-        if document.language != Language::Plain {
-            let (code, start) = if let Some(range) = region {
-                select(editor, range.start, range.end);
-                char_format(editor, 1, base, None);
-                (editor_range(editor, range.start, range.end), range.start)
-            } else {
-                (editor_text(editor), 0)
-            };
-            let mut index = 0;
-            let mut position = start;
-            for token in text::highlighting(&code, document.language) {
-                position += text::wide_offset(&code[index..], token.start - index);
-                let end =
-                    position + text::wide_offset(&code[token.start..], token.end - token.start);
-                select(editor, position, end);
-                char_format(
-                    editor,
-                    1,
-                    highlight_color(token.color, self.settings.dark),
-                    None,
-                );
-                position = end;
-                index = token.end;
-                document.colored = true;
-            }
+        for (range, color) in runs {
+            set_color(
+                offset + range.start,
+                offset + range.end,
+                color.map_or(base, |color| highlight_color(color, self.settings.dark)),
+            );
         }
+        drop(range_color);
         select(editor, saved_selection.start, saved_selection.end);
         send(editor, EM_SETSCROLLPOS, 0, &scroll as *const _ as isize);
         send(editor, EM_SETMODIFY, usize::from(modified != 0), 0);
         drop(hold);
-        painting(editor, true);
-        repaint(editor);
-        repaint(self.gutter);
+        if visible {
+            painting(editor, true);
+            repaint(editor);
+            repaint(self.gutter);
+            repaint(self.other_gutter);
+        }
+        document.highlighting = next;
+        document.colored_view = region;
+        document.highlight_pending = false;
     }
 
     fn repaint_editor(&mut self) {
@@ -1523,7 +1830,7 @@ impl App {
 
     fn save_document(&mut self, index: usize, save_as: bool) -> io::Result<bool> {
         let document = &self.documents[index];
-        if document.is_preview() {
+        if document.is_preview() || document.browser.is_some() {
             self.report("미리 보기 탭은 읽기 전용입니다.");
             return Ok(false);
         }
@@ -1567,12 +1874,18 @@ impl App {
             .unwrap_or(path.as_os_str())
             .to_string_lossy()
             .into_owned();
+        if document.language != Language::from_path(&path)
+            || !data_view::supports(document.language, Some(&path))
+        {
+            document.data_view = None;
+        }
         document.language = Language::from_path(&path);
         document.path = Some(path);
         document.dirty = false;
         send(editor, EM_SETMODIFY, 0, 0);
         if changed_path {
             self.format(index, true);
+            self.layout();
         }
         self.refresh_tab();
         self.update_status();
@@ -1622,8 +1935,9 @@ impl App {
     }
 
     fn remove_document(&mut self, index: usize, remember: bool) {
-        motion::clear(self.chrome.tabs);
+        self.clear_tab_motion();
         let document = self.documents.remove(index);
+        self.dock.forget_window_move(document.editor);
         if remember && let Some(path) = document.path {
             self.recently_closed.push(path);
         }
@@ -1631,18 +1945,38 @@ impl App {
             DestroyWindow(document.editor);
         }
         let adjust = |old: usize| if old > index { old - 1 } else { old };
-        self.other = self.other.filter(|&other| other != index).map(adjust);
-        if self.other.is_none() {
-            self.active_right = false;
+        let replacement = self
+            .documents
+            .iter()
+            .rposition(|doc| doc.group == document.group);
+        let had_split = self.other.is_some();
+        self.active = self.active.and_then(|old| {
+            if old == index {
+                replacement
+            } else {
+                Some(adjust(old))
+            }
+        });
+        self.other = self.other.and_then(|old| {
+            if old == index {
+                replacement
+            } else {
+                Some(adjust(old))
+            }
+        });
+        if had_split && (self.active.is_none() || self.other.is_none()) {
+            self.active = self.active.or(self.other);
+            self.collapse_editor_groups();
         }
-        let active = self.active.filter(|&active| active != index).map(adjust);
-        self.active = active;
         if self.documents.is_empty() {
             self.layout();
             self.update_status();
+            self.focus_editor();
+            self.queue_session_save();
         } else {
             self.activate(
-                active.unwrap_or_else(|| index.min(self.documents.len() - 1)),
+                self.active
+                    .unwrap_or_else(|| index.min(self.documents.len() - 1)),
                 true,
             );
         }
@@ -1991,6 +2325,9 @@ impl App {
                 ..
             } => {
                 self.archive_member(archive.clone(), path.clone(), *directory)?;
+            }
+            ListItem::File(path, _) if file_actions::executable(path) => {
+                self.report("실행 파일을 두 번 클릭하면 실행됩니다.");
             }
             ListItem::File(path, depth) => {
                 let path = path.clone();
@@ -2459,26 +2796,49 @@ impl App {
         {
             return;
         }
+        if !value.is_empty() {
+            let range = selection(editor);
+            if range.start != range.end {
+                self.invalidate_editor_styles(editor);
+            }
+        }
         send(editor, EM_STOPGROUPTYPING, 0, 0);
         replace_selection(editor, value);
         self.changed(editor);
+        self.update_caret_status();
+    }
+
+    fn invalidate_editor_styles(&mut self, editor: Handle) {
+        if let Some(doc) = self.documents.iter_mut().find(|doc| doc.editor == editor) {
+            doc.highlighting = None;
+        }
     }
 
     fn changed(&mut self, editor: Handle) {
         let Some(index) = self.documents.iter().position(|doc| doc.editor == editor) else {
             return;
         };
-        self.documents[index].colored_view = None;
+        self.documents[index].revision = self.documents[index].revision.wrapping_add(1);
+        self.documents[index].data_view = None;
+        let syntax = self.documents[index].language != Language::Plain;
+        self.documents[index].highlight_pending = syntax;
         let dirty = send(editor, EM_GETMODIFY, 0, 0) != 0;
         if self.documents[index].dirty != dirty {
             self.documents[index].dirty = dirty;
             self.refresh_tab();
+            self.update_status();
         }
         if self.showing_issues {
             self.show_files("");
         }
-        self.update_status();
+        repaint(self.gutter);
         self.queue_session_save();
+        if syntax {
+            self.queue_highlight();
+        }
+    }
+
+    fn queue_highlight(&self) {
         unsafe {
             SetTimer(self.window, COLOR_TIMER, 220, 0);
         }
@@ -2486,9 +2846,34 @@ impl App {
 
     fn on_command(&mut self, id: usize, event: u16, sender: Handle) {
         match (id, event) {
+            (data_view::TREE, 4) | (data_view::PRETTY_EDITOR, EN_SETFOCUS) => {
+                self.data_view_focus(sender)
+            }
+            (data_view::EXPAND_ALL | data_view::COLLAPSE_ALL, 0) => {
+                self.expand_data_view(sender, id == data_view::EXPAND_ALL);
+            }
+            (browser::WORK_FOLDER | browser::OPEN_FILE | browser::RECENT_FILE, 0) => {
+                if let Err(error) = self.browser_action(id, sender) {
+                    self.show_error(error);
+                }
+            }
+            (browser::QUERY_ID, 0x0200) => self.browser_focus_outline(sender),
+            (browser::QUERY_ID, EN_CHANGE) => self.browse_input(sender),
+            (LIST, 4) => self.recent_file_list = sender,
+            (browser::QUERY_ID, EN_SETFOCUS) | (browser::RESULTS, 4) => {
+                if id == browser::RESULTS {
+                    self.recent_file_list = sender;
+                }
+                self.browser_focus(sender);
+                self.browser_focus_outline(sender);
+            }
             (EDITOR, EN_CHANGE) => {
                 self.changed(sender);
-                if self.editor() == Some(sender) && unsafe { GetFocus() } == sender {
+                if self.editor() == Some(sender)
+                    && unsafe { GetFocus() } == sender
+                    && !chrome::deleting_text(sender)
+                    && self.documents[self.active.unwrap()].language != Language::Plain
+                {
                     self.completion_pending = Some(sender);
                     unsafe {
                         SetTimer(self.window, COMPLETION_TIMER, 125, 0);
@@ -2501,7 +2886,20 @@ impl App {
             {
                 self.dismiss_completion();
             }
-            (EDITOR, EN_VSCROLL) if self.editor() == Some(sender) => redraw(self.gutter),
+            (EDITOR, EN_VSCROLL) => {
+                for group in 0..2 {
+                    if self
+                        .group_document(group)
+                        .is_some_and(|i| self.documents[i].editor == sender)
+                    {
+                        repaint(if group == 0 {
+                            self.gutter
+                        } else {
+                            self.other_gutter
+                        });
+                    }
+                }
+            }
             (EDITOR, EN_SETFOCUS) => {
                 if let Some(index) = self.documents.iter().position(|doc| doc.editor == sender)
                     && self.active != Some(index)
@@ -2533,7 +2931,7 @@ impl App {
             && notice.code == EN_SELCHANGE
             && self.editor() == Some(notice.window)
         {
-            self.update_status();
+            self.update_caret_status();
         }
     }
 
@@ -2547,6 +2945,23 @@ impl App {
 
     fn perform(&mut self, id: usize) -> io::Result<()> {
         match id {
+            data_view::FIRST_MODE..=data_view::LAST_MODE => self.change_data_mode(id)?,
+            file_actions::COPY | file_actions::PASTE => {
+                self.file_clipboard(id, self.choose_clipboard_list())?;
+            }
+            browser::NEW_TAB => self.new_browser()?,
+            dock::NEW_SECONDARY => {
+                let base = self.root.clone().map_or_else(std::env::current_dir, Ok)?;
+                if let Some(path) =
+                    folder_dialog(self.window, Some(&base), "보조 탐색기 폴더 열기")?
+                {
+                    self.open_secondary_browser(path)?;
+                }
+            }
+            dock::CLOSE_SECONDARY => {
+                self.secondary_browser = None;
+                self.layout();
+            }
             git::EXPLORER_VIEW
             | git::CHANGES_VIEW
             | git::REFRESH
@@ -2565,11 +2980,12 @@ impl App {
             | terminal::DOCK_LEFT
             | terminal::DOCK_RIGHT
             | terminal::CLOSE_TAB => self.terminal_command(id)?,
-            NEW | WELCOME_NEW => self.new_document()?,
+            NEW => self.new_document()?,
+            WELCOME_NEW => self.new_browser()?,
             NEW_WINDOW => {
-                std::process::Command::new(std::env::current_exe()?)
-                    .arg("--new-window")
-                    .spawn()?;
+                self.new_window_sender()?
+                    .send(dock::Transfer::Empty)
+                    .map_err(|_| io::Error::other("새 창을 열 수 없습니다."))?;
             }
             OPEN | WELCOME_OPEN => {
                 let paths = file_dialog(self.window, false, OsStr::new(""))?;
@@ -2659,9 +3075,9 @@ impl App {
                 self.explorer_top = 0;
                 self.clear_mode();
             }
-            FILE_MENU | EDIT_MENU | TOOLS | PREFERENCES | terminal::MENU => {
-                self.show_toolbar_menu(id)
-            }
+            PREFERENCES => self.open_preferences()?,
+            FULLSCREEN => self.toggle_fullscreen(),
+            FILE_MENU | EDIT_MENU | TOOLS | terminal::MENU => self.show_toolbar_menu(id),
             ACTION => match self.mode {
                 Some(Mode::Find | Mode::Replace) => self.find(false),
                 Some(Mode::Workspace) => self.start_search(),
@@ -2723,6 +3139,7 @@ impl App {
     fn show_toolbar_menu(&mut self, id: usize) {
         let items: &[(usize, &str)] = match id {
             FILE_MENU => &[
+                (browser::NEW_TAB, "새 탭\tCtrl+T"),
                 (NEW, "새 파일\tCtrl+N"),
                 (NEW_WINDOW, "새 창\tCtrl+Shift+N"),
                 (OPEN, "파일 열기\tCtrl+O"),
@@ -2738,12 +3155,17 @@ impl App {
                 (REOPEN, "닫은 탭 다시 열기\tCtrl+Shift+T"),
             ],
             EDIT_MENU => &[
+                (file_actions::COPY, "파일·폴더 복사\tCtrl+C"),
+                (file_actions::PASTE, "파일·폴더 붙여넣기\tCtrl+V"),
+                (0, ""),
                 (FIND, "찾기\tCtrl+F"),
                 (REPLACE, "찾아 바꾸기\tCtrl+H"),
                 (WORKSPACE, "작업 폴더 검색\tCtrl+Shift+F"),
                 (GOTO, "줄로 이동\tCtrl+G"),
             ],
             TOOLS => &[
+                (dock::NEW_SECONDARY, "보조 탐색기 열기"),
+                (dock::CLOSE_SECONDARY, "보조 탐색기 닫기"),
                 (EXPLORER, "사이드바 표시 전환\tCtrl+B"),
                 (git::EXPLORER_VIEW, "파일 탐색기\tCtrl+Shift+E"),
                 (git::CHANGES_VIEW, "소스 제어\tCtrl+Shift+G"),
@@ -2759,6 +3181,7 @@ impl App {
                 (REFRESH, "폴더 새로고침"),
                 (0, ""),
                 (PROBLEMS, "문제 · 괄호 검사\tCtrl+Shift+M"),
+                (FULLSCREEN, "전체 화면 전환\tF11"),
                 (SPLIT, "다른 탭과 화면 분할\tCtrl+\\"),
                 (terminal::TOGGLE, "터미널 표시 전환\tCtrl+\x60"),
             ],
@@ -2779,54 +3202,68 @@ impl App {
                 (terminal::DOCK_LEFT, "왼쪽에 배치"),
                 (terminal::DOCK_RIGHT, "오른쪽에 배치"),
             ],
-            _ => &[
-                (
-                    THEME,
-                    if self.settings.dark {
-                        "밝은 테마"
-                    } else {
-                        "어두운 테마"
-                    },
-                ),
-                (
-                    WRAP,
-                    if self.settings.wrap {
-                        "자동 줄바꿈 끄기\tAlt+Z"
-                    } else {
-                        "자동 줄바꿈 켜기\tAlt+Z"
-                    },
-                ),
-                (FONT, "편집기 글꼴 변경"),
-                (BIGGER, "글자 키우기\tCtrl+="),
-                (SMALLER, "글자 줄이기\tCtrl+-"),
-                (RESET_FONT, "기본 글자 크기"),
-                (0, ""),
-                (INDENT_TWO, "들여쓰기 2칸"),
-                (INDENT_FOUR, "들여쓰기 4칸"),
-                (INDENT_TAB, "탭 문자로 들여쓰기"),
-            ],
+            _ => &[],
         };
         self.open_menu(id, items);
     }
 
-    fn toggle_split(&mut self) {
-        if self.other.take().is_some() {
-            self.active_right = false;
-            self.layout();
-            return;
+    fn toggle_fullscreen(&mut self) {
+        if let Some(saved) = self.fullscreen.take() {
+            fullscreen(self.window, Some(saved));
+        } else if let Some(saved) = window_placement(self.window)
+            && fullscreen(self.window, None)
+        {
+            self.fullscreen = Some(saved);
         }
-        let Some(active) = self.active else {
-            return;
-        };
-        if self.documents.len() < 2 {
-            self.report("분할하려면 파일이나 탭을 하나 더 여세요.");
-            return;
-        }
-        self.other = Some(if active > 0 { active - 1 } else { 1 });
         self.layout();
+        self.queue_session_save();
+    }
+
+    fn collapse_editor_groups(&mut self) {
+        self.other = None;
+        self.active_right = false;
+        for doc in &mut self.documents {
+            doc.group = 0;
+        }
+        self.clear_tab_motion();
+    }
+
+    fn toggle_split(&mut self) {
+        if self.other.is_some() {
+            self.collapse_editor_groups();
+            self.layout();
+        } else if let Some(active) = self.active {
+            let neighboring = active
+                .checked_sub(1)
+                .or_else(|| (self.documents.len() > 1).then_some(1));
+            self.split_document(active, dock::Destination::Right, neighboring);
+        }
     }
 
     fn keyboard(&mut self, target: Handle, key: i32) -> bool {
+        if key == 0x7a && unsafe { GetKeyState(0x11) >= 0 && GetKeyState(0x12) >= 0 } {
+            self.command(FULLSCREEN);
+            return true;
+        }
+        if matches!(key, 0x43 | 0x56)
+            && self.workspace_list(target)
+            && unsafe { GetKeyState(0x11) < 0 && GetKeyState(0x12) >= 0 }
+        {
+            if let Err(error) = self.file_clipboard(
+                if key == 0x43 {
+                    file_actions::COPY
+                } else {
+                    file_actions::PASTE
+                },
+                target,
+            ) {
+                self.show_error(error);
+            }
+            return true;
+        }
+        if self.keyboard_data_view(target, key) || self.browser_key(target, key) {
+            return true;
+        }
         if target == self.git.message && key == 13 {
             self.command(git::COMMIT);
             return true;
@@ -2890,14 +3327,23 @@ impl App {
         if target == self.list && self.tree_key(key) {
             return true;
         }
-        if target == self.chrome.tabs && matches!(key, 0x25 | 0x27) && !self.documents.is_empty() {
-            let current = self.active.unwrap_or(0);
+        if let Some(group) = self.chrome.tab_group(target)
+            && matches!(key, 0x25 | 0x27)
+        {
+            let current = self.group_document(group).unwrap_or(0);
+            let mut tabs = self
+                .documents
+                .iter()
+                .enumerate()
+                .filter(|(_, doc)| doc.group == group);
             let next = if key == 0x25 {
-                current.saturating_sub(1)
+                tabs.rfind(|(i, _)| *i < current)
             } else {
-                (current + 1).min(self.documents.len() - 1)
+                tabs.find(|(i, _)| *i > current)
             };
-            self.activate(next, false);
+            if let Some((index, _)) = next {
+                self.activate(index, false);
+            }
             return true;
         }
         let down = |vk| unsafe { GetKeyState(vk) < 0 };
@@ -2928,6 +3374,7 @@ impl App {
                 0x53 => SAVE,
                 0x73 | 0x57 => CLOSE,
                 0x54 if shift => REOPEN,
+                0x54 => browser::NEW_TAB,
                 0x50 if shift => TOOLS,
                 0x50 => QUICK,
                 0x46 if shift => WORKSPACE,
@@ -3045,8 +3492,12 @@ impl App {
                 _ => 0,
             };
             if edit_message != 0 {
+                if key == 0x56 {
+                    self.invalidate_editor_styles(editor);
+                }
                 send(editor, edit_message, if key == 0x56 { 13 } else { 0 }, 0);
                 self.changed(editor);
+                self.update_caret_status();
                 return true;
             }
             match key {
@@ -3119,10 +3570,30 @@ impl App {
         if self.terminal.visible {
             controls.push(self.terminal.body());
         }
-        if let Some(editor) = self.editor() {
-            controls.extend([self.chrome.tabs, editor]);
-        } else {
+        for group in 0..2 {
+            if group == 1 && self.other.is_none() {
+                continue;
+            }
+            controls.push(self.chrome.tab_handle(group));
+            controls.extend(self.data_buttons[group]);
+            if let Some(doc) = self.group_document(group).map(|i| &self.documents[i]) {
+                if let Some(view) = &doc.browser {
+                    controls.extend(view.keyboard_controls());
+                } else if doc.data_mode() != data_view::ViewMode::Raw {
+                    if let Some(view) = doc.data_view.as_ref() {
+                        controls.extend(view.keyboard_controls());
+                    }
+                } else {
+                    controls.push(doc.editor);
+                }
+            }
+        }
+        if self.documents.is_empty() {
             controls.extend(self.welcome_actions);
+        }
+        controls.retain(|&handle| unsafe { IsWindowVisible(handle) } != 0);
+        if controls.is_empty() {
+            return;
         }
         let index = controls
             .iter()
@@ -3196,9 +3667,11 @@ impl App {
 
     fn paint_gutter(&self, item: &DrawItem, paint: Paint) {
         fill(item.dc, item.rect, paint.background);
-        let Some(editor) = self.editor() else {
+        let group = usize::from(item.id as usize == OTHER_GUTTER);
+        let Some(index) = self.group_document(group) else {
             return;
         };
+        let editor = self.documents[index].editor;
         let first = send(editor, 0x00ce, 0, 0).max(0) as usize;
         let count = send(editor, 0x00ba, 0, 0).max(0) as usize;
         let mut height = (self.settings.points * self.dpi / 72 + self.px(4)).max(12);
@@ -3261,17 +3734,18 @@ fn same_path(a: &Path, b: &Path) -> bool {
 
 fn caret_position(editor: Handle, wrapped: bool) -> (usize, usize) {
     let index = selection(editor).end.max(0);
-    if !wrapped || editor_size(editor) > HIGHLIGHT_LIMIT {
-        let line = send(editor, 0x00c9, index as usize, 0).max(0);
-        let start = send(editor, 0x00bb, line as usize, 0).max(0);
-        return (line as usize, (index as isize - start).max(0) as usize + 1);
+    if wrapped && let Some((line, start)) = editor_paragraph(editor, index) {
+        let units = (index - start) as usize;
+        let column = if units <= 8192 {
+            editor_range(editor, start, index).chars().count()
+        } else {
+            units
+        };
+        return (line, column + 1);
     }
-    let code = editor_text(editor);
-    let byte = text::byte_offset(&code, index);
-    let prefix = &code[..byte];
-    let line = prefix.bytes().filter(|&b| b == b'\n').count();
-    let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;
-    (line, column)
+    let line = send(editor, 0x00c9, index as usize, 0).max(0);
+    let start = send(editor, 0x00bb, line as usize, 0).max(0);
+    (line as usize, (index as isize - start).max(0) as usize + 1)
 }
 
 fn highlight_color(color: Color, dark: bool) -> u32 {
@@ -3331,7 +3805,7 @@ mod tests {
         let editor = app.editor().expect("opened tab");
         assert_eq!(editor_text(editor), original);
         assert!(
-            app.documents[0].colored,
+            app.documents[0].highlighting.is_some(),
             "native syntax formatting initialized"
         );
         let bracket_color = |needle: &str| {
@@ -3374,6 +3848,45 @@ mod tests {
         assert_eq!(editor_text(editor), original);
         send(editor, EM_REDO, 0, 0);
         assert_eq!(editor_text(editor), edited);
+
+        app.settings.wrap = true;
+        app.apply_preferences();
+        let second_line = edited.find('\n').unwrap() + 1;
+        let content = edited[second_line..].find('\n').unwrap();
+        let end = text::wide_offset(&edited, second_line + content);
+        select(editor, end, end);
+        assert_eq!(
+            caret_position(editor, true),
+            (
+                1,
+                edited[second_line..second_line + content].chars().count() + 1
+            )
+        );
+        let end = text::wide_offset(&edited, second_line);
+        select(editor, end, end);
+        assert_eq!(caret_position(editor, true), (1, 1));
+
+        app.settings.wrap = false;
+        app.apply_preferences();
+        select(editor, 0, -1);
+        app.insert(editor, &edited);
+        app.repaint_editor();
+        select(editor, 0, 2);
+        assert_eq!(
+            selection_foreground(editor),
+            highlight_color(Color::Keyword, app.settings.dark)
+        );
+
+        let symbol = text::wide_offset(&edited, edited.find("fn ").unwrap() + 1);
+        select(editor, symbol, symbol + 1);
+        app.insert(editor, "");
+        app.repaint_editor();
+        select(editor, symbol - 1, symbol);
+        assert_eq!(
+            selection_foreground(editor),
+            PAINT.get().unwrap().foreground,
+            "deleting part of a keyword restores its ordinary color",
+        );
 
         let large = "fn sample() { let text = \"한글😀\"; }\n".repeat(9_000);
         app.add_document(

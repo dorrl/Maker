@@ -557,6 +557,7 @@ impl App {
                         document.archive_member = Some((archive, path));
                         send(document.editor, EM_SETREADONLY, 1, 0);
                         self.format(index, true);
+                        self.layout();
                         self.update_status();
                     }
                     Err(error) => self.show_error(error),

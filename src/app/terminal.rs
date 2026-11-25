@@ -27,7 +27,7 @@ const WM_RBUTTONUP: u32 = 0x0205;
 
 type CellPos = (usize, usize);
 
-struct Tab {
+pub(super) struct Tab {
     label: String,
     shell: Shell,
     directory: PathBuf,
@@ -169,6 +169,7 @@ pub(super) struct Panel {
     next_number: u64,
     first_tab: usize,
     hover: Option<Point>,
+    tab_drag: Option<(usize, Point)>,
     divider_hover: bool,
     panel_drag: Option<PanelDrag>,
     body_drag: Option<BodyDrag>,
@@ -217,6 +218,7 @@ impl Panel {
             next_number: 0,
             first_tab: 0,
             hover: None,
+            tab_drag: None,
             divider_hover: false,
             panel_drag: None,
             body_drag: None,
@@ -389,7 +391,17 @@ impl App {
         let header = self.px(31);
         let dock = self.settings.terminal_dock;
         let size = self.terminal_extent(dock, area);
+        let fills_window = self.detached && self.documents.is_empty();
         let (panel, edge, editor) = match dock {
+            _ if fills_window => (
+                area,
+                Rect::default(),
+                Rect {
+                    right: area.left,
+                    bottom: area.top,
+                    ..area
+                },
+            ),
             TerminalDock::Bottom => {
                 let split = area.bottom - size;
                 (
@@ -446,7 +458,11 @@ impl App {
         );
         show(self.terminal.header, true);
         show(self.terminal.body, panel.height() > header);
-        show_overlay(self.terminal.divider, edge);
+        if fills_window {
+            show(self.terminal.divider, false);
+        } else {
+            show_overlay(self.terminal.divider, edge);
+        }
         self.terminal.reveal_tab(self.dpi);
         let size = self.terminal.inner_size(self.dpi);
         if let Some(tab) = self.terminal.active_mut() {
@@ -573,8 +589,53 @@ impl App {
         if index >= self.terminal.tabs.len() {
             return;
         }
-        motion::clear(self.terminal.header);
         self.terminal.tabs.remove(index);
+        self.after_terminal_removed(index);
+    }
+
+    fn detach_terminal(
+        &mut self,
+        index: usize,
+        destination: Option<dock::DropTarget>,
+    ) -> io::Result<()> {
+        let sender = if destination.is_none() {
+            Some(self.new_window_sender()?)
+        } else {
+            None
+        };
+        let tab = self.terminal.tabs.remove(index);
+        let transfer = dock::Transfer::Terminal(Box::new(tab));
+        let result = if let Some(target) = destination {
+            target.send(transfer, None)
+        } else {
+            sender.unwrap().send(transfer).map_err(|error| error.0)
+        };
+        match result {
+            Ok(()) => {
+                self.after_terminal_removed(index);
+                Ok(())
+            }
+            Err(dock::Transfer::Terminal(tab)) => {
+                self.terminal.tabs.insert(index, *tab);
+                Err(io::Error::other("터미널을 대상 창으로 옮길 수 없습니다."))
+            }
+            Err(_) => unreachable!("only terminal transfers sent here"),
+        }
+    }
+
+    pub(super) fn accept_terminal(&mut self, tab: Tab) {
+        self.terminal.visible = true;
+        self.terminal.next_number += 1;
+        self.terminal.tabs.push(tab);
+        self.layout();
+        self.activate_terminal(self.terminal.tabs.len() - 1);
+        unsafe {
+            SetTimer(self.window, TIMER, 30, 0);
+        }
+    }
+
+    fn after_terminal_removed(&mut self, index: usize) {
+        motion::clear(self.terminal.header);
         if self.terminal.tabs.is_empty() {
             self.terminal.active = 0;
             self.terminal.first_tab = 0;
@@ -598,7 +659,7 @@ impl App {
         self.queue_session_save();
     }
 
-    fn focus_terminal(&self) {
+    pub(super) fn focus_terminal(&self) {
         if self.terminal.visible {
             unsafe {
                 SetFocus(self.terminal.body);
@@ -891,7 +952,41 @@ impl App {
     }
 
     fn terminal_header_mouse(&mut self, msg: u32, wp: usize, point: Point) {
-        let rect = bounds(self.terminal.header);
+        let header = self.terminal.header;
+        let rect = bounds(header);
+        if let Some((index, origin)) = self.terminal.tab_drag {
+            let moved = (point.x - origin.x).abs().max((point.y - origin.y).abs()) >= self.px(7);
+            match msg {
+                WM_MOUSEMOVE if moved => {
+                    if rect.has(point) || self.transfer_target(header, point).is_some() {
+                        self.clear_dock();
+                    } else {
+                        self.show_dock(dock::Destination::Window);
+                    }
+                }
+                WM_LBUTTONUP => {
+                    self.terminal.tab_drag = None;
+                    self.clear_dock();
+                    unsafe {
+                        ReleaseCapture();
+                    }
+                    if moved
+                        && !rect.has(point)
+                        && index < self.terminal.tabs.len()
+                        && let Err(error) =
+                            self.detach_terminal(index, self.transfer_target(header, point))
+                    {
+                        self.show_error(error);
+                    }
+                    return;
+                }
+                WM_CAPTURECHANGED => {
+                    self.terminal.tab_drag = None;
+                    self.clear_dock();
+                }
+                _ => {}
+            }
+        }
         let (left, room, action) = self.terminal.controls(rect, self.dpi);
         let (width, visible) = self.terminal.tab_width(rect, self.dpi);
         match msg {
@@ -965,6 +1060,10 @@ impl App {
                             self.close_terminal_tab(index);
                         } else {
                             self.activate_terminal(index);
+                            self.terminal.tab_drag = Some((index, point));
+                            unsafe {
+                                SetCapture(header);
+                            }
                         }
                     }
                 }
