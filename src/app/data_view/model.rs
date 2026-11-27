@@ -14,7 +14,7 @@ use crate::text::{Color, Language};
 pub(super) const MAX_INPUT: usize = 8 * 1024 * 1024;
 const MAX_OUTPUT: usize = 24 * 1024 * 1024;
 const MAX_DEPTH: usize = 128;
-const MAX_NODES: usize = 200_000;
+pub(super) const MAX_NODES: usize = 200_000;
 
 pub(super) struct Model {
     pub pretty: Option<String>,
@@ -79,7 +79,10 @@ impl Node {
 
 pub(super) fn parse(code: &str, language: Language) -> io::Result<Model> {
     if code.len() > MAX_INPUT {
-        return Err(io::Error::other("JSON/YAML preview is limited to 8 MiB."));
+        return Err(io::Error::other(crate::i18n::text("data.max_input")));
+    }
+    if matches!(language, Language::Html | Language::Xml) {
+        return super::markup::parse(code, language);
     }
     let docs = if language == Language::Json {
         serde_json::from_str::<&RawValue>(code).map_err(io::Error::other)?;
@@ -103,7 +106,7 @@ pub(super) fn parse(code: &str, language: Language) -> io::Result<Model> {
     for (index, doc) in docs.iter().enumerate() {
         roots.push(entries.len());
         let key = if docs.len() > 1 {
-            format!("문서 {}", index + 1)
+            crate::i18n::message("ui.document", &[(index + 1).to_string()])
         } else {
             String::new()
         };
@@ -120,12 +123,10 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn check_budget(count: &mut usize, depth: usize) -> io::Result<()> {
+pub(super) fn check_budget(count: &mut usize, depth: usize) -> io::Result<()> {
     *count += 1;
     if *count > MAX_NODES || depth >= MAX_DEPTH {
-        return Err(io::Error::other(
-            "JSON/YAML structure exceeds the preview limit.",
-        ));
+        return Err(io::Error::other(crate::i18n::text("data.max_structure")));
     }
     Ok(())
 }
@@ -158,7 +159,7 @@ impl<'a> Json<'a> {
     fn string(&mut self) -> io::Result<&'a str> {
         let text = self.rest.trim_start();
         if !text.starts_with('"') {
-            return Err(invalid("Expected a JSON string"));
+            return Err(invalid(crate::i18n::text("data.json.expected_string")));
         }
         let mut escaped = false;
         for (index, byte) in text.bytes().enumerate().skip(1) {
@@ -168,7 +169,7 @@ impl<'a> Json<'a> {
             }
             escaped = !escaped && byte == b'\\';
         }
-        Err(invalid("Unclosed JSON string"))
+        Err(invalid(crate::i18n::text("data.json.unclosed_string")))
     }
 
     fn node(&mut self, depth: usize) -> io::Result<Node> {
@@ -179,14 +180,14 @@ impl<'a> Json<'a> {
                 loop {
                     let key = Node::plain(self.string()?, Color::String);
                     if !self.take(':') {
-                        return Err(invalid("Expected a JSON ':'"));
+                        return Err(invalid(crate::i18n::text("data.json.expected_colon")));
                     }
                     entries.push((key, self.node(depth + 1)?));
                     if self.take('}') {
                         break;
                     }
                     if !self.take(',') {
-                        return Err(invalid("Expected a JSON ','"));
+                        return Err(invalid(crate::i18n::text("data.json.expected_comma")));
                     }
                 }
             }
@@ -200,7 +201,7 @@ impl<'a> Json<'a> {
                         break;
                     }
                     if !self.take(',') {
-                        return Err(invalid("Expected a JSON ','"));
+                        return Err(invalid(crate::i18n::text("data.json.expected_comma")));
                     }
                 }
             }
@@ -217,7 +218,7 @@ impl<'a> Json<'a> {
                 &text[..end]
             };
             if token.is_empty() {
-                return Err(invalid("Expected a JSON value"));
+                return Err(invalid(crate::i18n::text("data.json.expected_value")));
             }
             Ok(Node::plain(token, scalar_color(token)))
         }
@@ -251,7 +252,7 @@ fn read_yaml(code: &str) -> io::Result<Vec<ParsedDocument<'_>>> {
                 docs.push(ParsedDocument { root, version });
                 yaml_event(&mut reader, Event::DocumentEnd)?;
             }
-            _ => return Err(invalid("Expected a YAML document")),
+            _ => return Err(invalid(crate::i18n::text("data.yaml.expected_document"))),
         }
     }
 }
@@ -267,7 +268,7 @@ fn yaml_event<T: Iterator<Item = char>>(parser: &mut Parser<T>, expected: Event)
     if next_yaml(parser)? == expected {
         Ok(())
     } else {
-        Err(invalid("Unexpected YAML event"))
+        Err(invalid(crate::i18n::text("data.yaml.unexpected_event")))
     }
 }
 
@@ -340,7 +341,7 @@ fn yaml_node<T: Iterator<Item = char>>(
             }
             (Value::Map(nodes), anchor, tag)
         }
-        _ => return Err(invalid("Expected a YAML value")),
+        _ => return Err(invalid(crate::i18n::text("data.yaml.expected_value"))),
     };
     Ok(Node {
         value,
@@ -349,7 +350,7 @@ fn yaml_node<T: Iterator<Item = char>>(
 }
 
 #[derive(Default)]
-struct Output(String);
+pub(super) struct Output(pub(super) String);
 
 impl Write for Output {
     fn write_str(&mut self, text: &str) -> fmt::Result {
@@ -361,7 +362,7 @@ impl Write for Output {
     }
 }
 
-fn indent(out: &mut Output, depth: usize) -> fmt::Result {
+pub(super) fn indent(out: &mut Output, depth: usize) -> fmt::Result {
     const SPACES: &str = "                                                                ";
     let mut remaining = depth * 2;
     while remaining >= SPACES.len() {
@@ -501,7 +502,7 @@ fn block(out: &mut Output, node: &Node, depth: usize) -> fmt::Result {
     Ok(())
 }
 
-fn preview(text: &str, limit: usize) -> String {
+pub(super) fn preview(text: &str, limit: usize) -> String {
     let mut text = text.chars();
     let mut result: String = text
         .by_ref()

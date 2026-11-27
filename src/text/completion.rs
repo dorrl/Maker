@@ -16,14 +16,14 @@ pub enum Kind {
 impl Kind {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Local => "심볼",
-            Self::Function => "함수",
-            Self::Type => "타입",
-            Self::Member => "멤버",
-            Self::Builtin => "내장",
-            Self::Keyword => "키워드",
-            Self::Snippet => "스니펫",
-            Self::Word => "문서",
+            Self::Local => crate::i18n::text("ui.symbol"),
+            Self::Function => crate::i18n::text("ui.function"),
+            Self::Type => crate::i18n::text("ui.type"),
+            Self::Member => crate::i18n::text("ui.member"),
+            Self::Builtin => crate::i18n::text("ui.built.in"),
+            Self::Keyword => crate::i18n::text("ui.keyword"),
+            Self::Snippet => crate::i18n::text("ui.snippet"),
+            Self::Word => crate::i18n::text("ui.document_2"),
         }
     }
 }

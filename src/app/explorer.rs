@@ -21,8 +21,8 @@ pub(super) struct Explorer {
 impl Explorer {
     pub fn new(window: Handle) -> io::Result<Self> {
         let button = |id, label| child(window, id, "BUTTON", label, BS_OWNERDRAW | WS_TABSTOP);
-        let file = button(NEW_FILE, "새 파일")?;
-        let folder = button(NEW_FOLDER, "새 폴더")?;
+        let file = button(NEW_FILE, crate::i18n::text("ui.new.file"))?;
+        let folder = button(NEW_FOLDER, crate::i18n::text("ui.new.folder"))?;
         chrome::watch_control(file, true);
         chrome::watch_control(folder, true);
         Ok(Self {
@@ -147,7 +147,9 @@ impl App {
 
     pub(super) fn new_explorer_item(&mut self, folder: bool) -> io::Result<()> {
         let Some(root) = self.root.as_ref() else {
-            return Err(io::Error::other("먼저 작업 폴더를 여세요."));
+            return Err(io::Error::other(crate::i18n::text(
+                "ui.open.a.workspace.folder.first",
+            )));
         };
         let parent = self
             .explorer_selection
@@ -163,9 +165,9 @@ impl App {
             .unwrap_or(root)
             .to_owned();
         self.report(if folder {
-            "새 폴더 이름을 입력하고 Enter를 누르세요."
+            crate::i18n::text("ui.enter.a.new.folder.name.and.press")
         } else {
-            "새 파일 이름을 입력하고 Enter를 누르세요."
+            crate::i18n::text("ui.enter.a.new.file.name.and.press")
         });
         if self.mode == Some(Mode::Rename) {
             self.clear_mode();
@@ -180,7 +182,7 @@ impl App {
         }
         let selected = list_selection(self.list);
         if selected.len() != 1 {
-            self.report("이름을 바꿀 파일이나 폴더를 하나만 선택하세요.");
+            self.report(crate::i18n::text("ui.select.one.file.or.folder.to.rename"));
             return;
         }
         let row = selected[0];
@@ -199,9 +201,9 @@ impl App {
         title(
             self.mode_label,
             if path.is_file() {
-                "파일 이름"
+                crate::i18n::text("ui.file.name")
             } else {
-                "폴더 이름"
+                crate::i18n::text("ui.folder.name")
             },
         );
         title(self.query, &label);
@@ -286,7 +288,7 @@ impl App {
             }
         }
         self.update_status();
-        self.report("탐색기에 반영했습니다.");
+        self.report(crate::i18n::text("ui.updated.in.explorer"));
         self.request_git_refresh();
         self.queue_session_save();
         Ok(())
@@ -340,22 +342,28 @@ impl App {
                 .take_while(|parent| *parent != root)
             {
                 if fs::symlink_metadata(parent)?.file_attributes() & 0x400 != 0 {
-                    return Err(io::Error::other(
-                        "연결된 폴더 안에서는 휴지통으로 이동할 수 없습니다.",
-                    ));
+                    return Err(io::Error::other(crate::i18n::text(
+                        "ui.items.in.linked.folders.cannot.be.moved",
+                    )));
                 }
             }
             paths.push(path.to_owned());
         }
         if paths.is_empty() {
-            self.report("휴지통으로 보낼 파일이나 폴더를 선택하세요.");
+            self.report(crate::i18n::text("ui.select.files.or.folders.to.move.to"));
             return Ok(());
         }
         let count = paths.len();
         let prompt = if count == 1 {
-            format!("「{}」 항목을 휴지통으로 이동할까요?", file_name(&paths[0]))
+            crate::i18n::message(
+                "ui.move.to.the.recycle.bin",
+                &[(file_name(&paths[0])).to_string()],
+            )
         } else {
-            format!("선택한 {count}개 항목을 휴지통으로 이동할까요?")
+            crate::i18n::message(
+                "ui.move.the.selected.items.to.the.recycle",
+                &[(count).to_string()],
+            )
         };
         if message(
             self.window,
@@ -377,7 +385,8 @@ impl App {
                 if doc.path.as_deref().is_some_and(removed) {
                     if send(doc.editor, EM_GETMODIFY, 0, 0) != 0 {
                         doc.path = None;
-                        doc.label = format!("{} · 미저장", doc.label);
+                        doc.label =
+                            crate::i18n::message("ui.unsaved", std::slice::from_ref(&doc.label));
                     } else {
                         self.remove_document(index, false);
                     }
@@ -411,11 +420,11 @@ impl App {
         let completed = result?;
         let deleted = paths.len();
         self.report(if completed && deleted == count {
-            "휴지통으로 이동했습니다."
+            crate::i18n::text("ui.moved.to.the.recycle.bin")
         } else if deleted > 0 {
-            "일부 항목을 휴지통으로 이동했습니다."
+            crate::i18n::text("ui.some.items.were.moved.to.the.recycle")
         } else {
-            "휴지통 이동을 취소했거나 선택한 항목을 이동할 수 없습니다."
+            crate::i18n::text("ui.the.recycle.bin.operation.was.canceled.or")
         });
         Ok(())
     }

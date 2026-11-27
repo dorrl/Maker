@@ -14,7 +14,10 @@ pub const WM_DESTROY: u32 = 0x0002;
 pub const WM_SIZE: u32 = 0x0005;
 pub const WM_MOVE: u32 = 0x0003;
 pub const WM_CLOSE: u32 = 0x0010;
+pub const WM_SETFOCUS: u32 = 0x0007;
+pub const WM_KILLFOCUS: u32 = 0x0008;
 pub const WM_ERASEBKGND: u32 = 0x0014;
+pub const WM_SHOWWINDOW: u32 = 0x0018;
 pub const WM_DRAWITEM: u32 = 0x002b;
 pub const WM_NOTIFY: u32 = 0x004e;
 pub const WM_KEYDOWN: u32 = 0x0100;
@@ -23,12 +26,16 @@ pub const WM_COMMAND: u32 = 0x0111;
 pub const WM_TIMER: u32 = 0x0113;
 pub const WM_CTLCOLOREDIT: u32 = 0x0133;
 pub const WM_CTLCOLORLISTBOX: u32 = 0x0134;
+pub const WM_CTLCOLORBTN: u32 = 0x0135;
 pub const WM_CTLCOLORSTATIC: u32 = 0x0138;
 pub const WM_DROPFILES: u32 = 0x0233;
 pub const WM_SETTINGCHANGE: u32 = 0x001a;
 pub const WM_DPICHANGED: u32 = 0x02e0;
 pub const WM_PAINT: u32 = 0x000f;
 pub const WM_PRINTCLIENT: u32 = 0x0318;
+pub const WM_NCPAINT: u32 = 0x0085;
+pub const WM_NCMOUSEMOVE: u32 = 0x00a0;
+pub const WM_NCLBUTTONDOWN: u32 = 0x00a1;
 pub const WM_SETCURSOR: u32 = 0x0020;
 pub const WM_MOUSEMOVE: u32 = 0x0200;
 pub const WM_LBUTTONDOWN: u32 = 0x0201;
@@ -53,6 +60,7 @@ pub const ES_NOHIDESEL: u32 = 0x0100;
 pub const ES_WANTRETURN: u32 = 0x1000;
 pub const ES_DISABLENOSCROLL: u32 = 0x2000;
 pub const BS_OWNERDRAW: u32 = 0x000b;
+pub const BM_GETSTATE: u32 = 0x00f2;
 pub const LBS_NOTIFY: u32 = 0x0001;
 pub const LBS_OWNERDRAWFIXED: u32 = 0x0010;
 pub const LBS_HASSTRINGS: u32 = 0x0040;
@@ -65,6 +73,8 @@ pub const SS_NOPREFIX: u32 = 0x0080;
 pub const EM_SETMODIFY: u32 = 0x00b9;
 pub const EM_GETMODIFY: u32 = 0x00b8;
 pub const EM_SCROLLCARET: u32 = 0x00b7;
+pub const EM_SCROLL: u32 = 0x00b5;
+pub const EM_LINESCROLL: u32 = 0x00b6;
 pub const EM_EMPTYUNDOBUFFER: u32 = 0x00cd;
 pub const EM_REDO: u32 = 0x0400 + 84;
 pub const EM_UNDO: u32 = 0x00c7;
@@ -85,9 +95,11 @@ pub const ENM_SCROLL: isize = 4;
 pub const ENM_SELCHANGE: isize = 0x00080000;
 pub const LB_RESETCONTENT: u32 = 0x0184;
 pub const LB_ADDSTRING: u32 = 0x0180;
+pub const LB_GETCOUNT: u32 = 0x018b;
 pub const LB_GETTOPINDEX: u32 = 0x018e;
 pub const LB_SETTOPINDEX: u32 = 0x0197;
 pub const LB_SETITEMHEIGHT: u32 = 0x01a0;
+pub const LB_GETITEMHEIGHT: u32 = 0x01a1;
 pub const LB_SETITEMDATA: u32 = 0x019a;
 const LB_SETSEL: u32 = 0x0185;
 const LB_GETSELCOUNT: u32 = 0x0190;
@@ -100,6 +112,9 @@ pub const MB_ICONWARNING: u32 = 0x30;
 pub const MB_OKCANCEL: u32 = 1;
 pub const MB_DEFBUTTON2: u32 = 0x100;
 pub const EM_SETREADONLY: u32 = 0x00cf;
+const SWP_NOACTIVATE: u32 = 0x0010;
+const SWP_NOCOPYBITS: u32 = 0x0100;
+const SWP_DEFERERASE: u32 = 0x2000;
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -460,6 +475,28 @@ struct PaintStruct {
 }
 
 #[repr(C)]
+pub struct ComboBoxInfo {
+    size: u32,
+    item: Rect,
+    pub button: Rect,
+    state: u32,
+    combo: Handle,
+    pub edit: Handle,
+    pub list: Handle,
+}
+
+#[repr(C)]
+struct LogFont {
+    metrics: [i32; 5],
+    italic: u8,
+    underline: u8,
+    strikeout: u8,
+    charset: u8,
+    quality: [u8; 4],
+    face: [u16; 32],
+}
+
+#[repr(C)]
 struct TrackMouse {
     size: u32,
     flags: u32,
@@ -468,6 +505,7 @@ struct TrackMouse {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ScrollInfo {
     size: u32,
     mask: u32,
@@ -536,6 +574,7 @@ unsafe extern "system" {
     pub fn SetFocus(window: Handle) -> Handle;
     pub fn GetFocus() -> Handle;
     fn GetDC(window: Handle) -> Handle;
+    fn GetWindowDC(window: Handle) -> Handle;
     fn ReleaseDC(window: Handle, dc: Handle) -> i32;
     fn GetClipboardSequenceNumber() -> u32;
     fn OpenClipboard(window: Handle) -> i32;
@@ -590,6 +629,7 @@ unsafe extern "system" {
     fn CreateSolidBrush(color: u32) -> Handle;
     fn CreateCompatibleDC(dc: Handle) -> Handle;
     fn CreateCompatibleBitmap(dc: Handle, width: i32, height: i32) -> Handle;
+    fn SetViewportOrgEx(dc: Handle, x: i32, y: i32, previous: *mut Point) -> i32;
     fn DeleteDC(dc: Handle) -> i32;
     fn BitBlt(
         dst: Handle,
@@ -625,6 +665,13 @@ unsafe extern "system" {
         family: u32,
         face: *const u16,
     ) -> Handle;
+    fn EnumFontFamiliesExW(
+        dc: Handle,
+        filter: *mut LogFont,
+        callback: extern "system" fn(*const LogFont, *const c_void, u32, isize) -> i32,
+        data: isize,
+        flags: u32,
+    ) -> i32;
 }
 
 #[link(name = "comctl32")]
@@ -686,7 +733,10 @@ impl Ole {
     pub fn init() -> io::Result<Self> {
         let code = unsafe { OleInitialize(null_mut()) };
         if code < 0 {
-            return Err(io::Error::other(format!("OLE 초기화 실패 ({code:#x})")));
+            return Err(io::Error::other(crate::i18n::message(
+                "ui.ole.initialization.failed",
+                &[format!("{:#x}", code)],
+            )));
         }
         Ok(Self)
     }
@@ -800,9 +850,9 @@ pub fn tool_window(class: &str, label: &str, parent: Handle, size: Point) -> io:
     }
 }
 
-pub fn next_dialog_control(window: Handle, previous: bool) {
+pub fn next_dialog_control(window: Handle, current: Handle, previous: bool) {
     unsafe {
-        SetFocus(GetNextDlgTabItem(window, GetFocus(), i32::from(previous)));
+        SetFocus(GetNextDlgTabItem(window, current, i32::from(previous)));
     }
 }
 
@@ -975,7 +1025,7 @@ pub fn show_overlay(window: Handle, rect: Rect) {
         let flags = if relative_rect(window, GetParent(window)) == rect {
             0x0053
         } else {
-            0x0050
+            0x0050 | SWP_NOCOPYBITS | SWP_DEFERERASE
         };
         SetWindowPos(
             window,
@@ -1051,10 +1101,62 @@ pub fn clear_clip(window: Handle) {
 }
 
 pub fn paint(window: Handle, draw: impl FnOnce(Handle, Rect)) {
+    paint_region(window, |dc, bounds, _| draw(dc, bounds));
+}
+
+pub fn combo_info(window: Handle) -> ComboBoxInfo {
+    let mut info: ComboBoxInfo = unsafe { std::mem::zeroed() };
+    info.size = size_of::<ComboBoxInfo>() as u32;
+    send(window, 0x0164, 0, &mut info as *mut _ as isize);
+    info
+}
+
+pub fn paint_window_frame(window: Handle, brush: Handle) -> bool {
+    paint_window_frame_with_scroll(window, brush, |_, _| {})
+}
+
+pub fn paint_window_frame_with_scroll(
+    window: Handle,
+    brush: Handle,
+    draw: impl FnOnce(Handle, Rect),
+) -> bool {
+    let dc = unsafe { GetWindowDC(window) };
+    if dc == 0 {
+        return false;
+    }
+    let outer = relative_rect(window, 0);
+    let origin = map_point(window, 0, Point::default());
+    let client = bounds(window);
+    let x = origin.x - outer.left;
+    let y = origin.y - outer.top;
+    let right = x + client.width();
+    let bottom = y + client.height();
+    for band in [
+        Rect::from_size(0, 0, outer.width(), y),
+        Rect::from_size(0, bottom, outer.width(), outer.height() - bottom),
+        Rect::from_size(0, y, x, client.height()),
+        Rect::from_size(right, y, outer.width() - right, client.height()),
+    ] {
+        fill(dc, band, brush);
+    }
+    draw(
+        dc,
+        Rect::from_size(
+            right,
+            y,
+            (outer.width() - right - x).max(0),
+            client.height(),
+        ),
+    );
+    unsafe { ReleaseDC(window, dc) };
+    true
+}
+
+fn paint_region(window: Handle, draw: impl FnOnce(Handle, Rect, Rect)) {
     let mut context: PaintStruct = unsafe { std::mem::zeroed() };
     let dc = unsafe { BeginPaint(window, &mut context) };
     if dc != 0 {
-        draw(dc, bounds(window));
+        draw(dc, bounds(window), context.rect);
     }
     unsafe {
         EndPaint(window, &context);
@@ -1062,26 +1164,21 @@ pub fn paint(window: Handle, draw: impl FnOnce(Handle, Rect)) {
 }
 
 pub fn buffered_paint(window: Handle, draw: impl FnOnce(Handle, Rect)) {
-    paint(window, |dc, area| {
-        if area.width() == 0 || area.height() == 0 {
+    paint_region(window, |dc, area, dirty| {
+        let (width, height) = (dirty.width(), dirty.height());
+        if width == 0 || height == 0 {
             return;
         }
         unsafe {
             let buffer = CreateCompatibleDC(dc);
-            let bitmap = CreateCompatibleBitmap(dc, area.width(), area.height());
+            let bitmap = CreateCompatibleBitmap(dc, width, height);
             if buffer != 0 && bitmap != 0 {
                 let previous = SelectObject(buffer, bitmap);
+                SetViewportOrgEx(buffer, -dirty.left, -dirty.top, null_mut());
                 draw(buffer, area);
+                SetViewportOrgEx(buffer, 0, 0, null_mut());
                 BitBlt(
-                    dc,
-                    0,
-                    0,
-                    area.width(),
-                    area.height(),
-                    buffer,
-                    0,
-                    0,
-                    0x00cc0020,
+                    dc, dirty.left, dirty.top, width, height, buffer, 0, 0, 0x00cc0020,
                 );
                 SelectObject(buffer, previous);
             } else {
@@ -1176,7 +1273,15 @@ pub fn place(window: Handle, x: i32, y: i32, width: i32, height: i32) {
     let area = Rect::from_size(x, y, width.max(0), height.max(0));
     unsafe {
         if relative_rect(window, GetParent(window)) != area {
-            SetWindowPos(window, 0, x, y, area.width(), area.height(), 0x14);
+            SetWindowPos(
+                window,
+                0,
+                x,
+                y,
+                area.width(),
+                area.height(),
+                4 | SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_DEFERERASE,
+            );
         }
     }
 }
@@ -1209,6 +1314,14 @@ pub fn client_animations() -> bool {
         SystemParametersInfoW(0x1042, 0, (&mut enabled as *mut i32).cast(), 0);
     }
     enabled != 0
+}
+
+pub fn wheel_scroll_lines() -> u32 {
+    let mut lines = 3u32;
+    unsafe {
+        SystemParametersInfoW(0x0068, 0, (&mut lines as *mut u32).cast(), 0);
+    }
+    lines
 }
 
 pub fn editor_character_at(window: Handle, point: Point) -> i32 {
@@ -1263,6 +1376,69 @@ pub fn message(window: Handle, body: &str, title: &str, style: u32) -> i32 {
     unsafe { MessageBoxW(window, body.as_ptr(), title.as_ptr(), style) }
 }
 
+pub fn shell_open(window: Handle, target: &OsStr) -> io::Result<()> {
+    let target = wide(target);
+    let result = unsafe {
+        ShellExecuteW(
+            window,
+            wide("open").as_ptr(),
+            target.as_ptr(),
+            null(),
+            null(),
+            1,
+        )
+    };
+    if result <= 32 {
+        Err(io::Error::other(crate::i18n::message(
+            "ui.could.not.open.in.the.browser",
+            &[(result).to_string()],
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn open_html_file(window: Handle, path: &std::path::Path) -> io::Result<()> {
+    #[link(name = "shlwapi")]
+    unsafe extern "system" {
+        fn AssocQueryStringW(
+            flags: u32,
+            value: u32,
+            association: *const u16,
+            verb: *const u16,
+            output: *mut u16,
+            length: *mut u32,
+        ) -> i32;
+    }
+    const PROTOCOL: u32 = 0x1000;
+    const EXECUTABLE: u32 = 2;
+    let mut program = vec![0u16; 32_768];
+    let mut length = program.len() as u32;
+    let found = unsafe {
+        AssocQueryStringW(
+            PROTOCOL,
+            EXECUTABLE,
+            wide("https").as_ptr(),
+            null(),
+            program.as_mut_ptr(),
+            &mut length,
+        )
+    };
+    if found == 0 {
+        let browser =
+            OsString::from_wide(&program[..(length as usize).saturating_sub(1).min(program.len())]);
+        if std::path::Path::new(&browser).is_absolute()
+            && std::process::Command::new(browser)
+                .arg(path)
+                .spawn()
+                .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    shell_open(window, path.as_os_str())
+}
+
 pub fn run_application(window: Handle, path: &std::path::Path) -> io::Result<()> {
     let file = wide(path);
     let directory = path.parent().map(wide);
@@ -1279,8 +1455,9 @@ pub fn run_application(window: Handle, path: &std::path::Path) -> io::Result<()>
         )
     };
     if result <= 32 {
-        Err(io::Error::other(format!(
-            "실행 파일을 열 수 없습니다. ({result})"
+        Err(io::Error::other(crate::i18n::message(
+            "ui.could.not.open.the.executable",
+            &[(result).to_string()],
         )))
     } else {
         Ok(())
@@ -1315,9 +1492,9 @@ fn shell_file_operation(
     let check = |result: i32| {
         if result < 0 {
             let message = if folder.is_some() {
-                "파일을 복사할 수 없습니다."
+                crate::i18n::text("ui.could.not.copy.the.files")
             } else {
-                "휴지통으로 이동할 수 없습니다."
+                crate::i18n::text("ui.could.not.move.the.items.to.the")
             };
             Err(io::Error::other(format!("{message} ({result:#x})")))
         } else {
@@ -1393,6 +1570,32 @@ pub fn fill(dc: Handle, rect: Rect, brush: Handle) {
 }
 pub fn font(height: i32) -> Handle {
     named_font("Segoe UI", height)
+}
+
+pub fn font_families(window: Handle) -> Vec<String> {
+    extern "system" fn collect(font: *const LogFont, _: *const c_void, _: u32, data: isize) -> i32 {
+        let face = unsafe { &(*font).face };
+        let end = face.iter().position(|&ch| ch == 0).unwrap_or(face.len());
+        let name = String::from_utf16_lossy(&face[..end]);
+        if !name.is_empty() && !name.starts_with('@') {
+            unsafe { &mut *(data as *mut Vec<String>) }.push(name);
+        }
+        1
+    }
+
+    let mut names = Vec::new();
+    unsafe {
+        let dc = GetDC(window);
+        if dc != 0 {
+            let mut filter: LogFont = std::mem::zeroed();
+            filter.charset = 1; // DEFAULT_CHARSET enumerates every available family.
+            EnumFontFamiliesExW(dc, &mut filter, collect, &mut names as *mut _ as isize, 0);
+            ReleaseDC(window, dc);
+        }
+    }
+    names.sort_by_cached_key(|name: &String| name.to_lowercase());
+    names.dedup_by(|a, b| a.to_lowercase() == b.to_lowercase());
+    names
 }
 
 pub fn named_font(family: &str, height: i32) -> Handle {
@@ -1633,7 +1836,7 @@ pub fn file_dialog(window: Handle, save: bool, suggestion: &OsStr) -> io::Result
     let suggestion = wide(suggestion);
     let amount = suggestion.len().min(buffer.len() - 1);
     buffer[..amount].copy_from_slice(&suggestion[..amount]);
-    let filter = wide("모든 파일\0*.*\0");
+    let filter = wide(crate::i18n::text("ui.all.files"));
     let mut info: OpenFile = unsafe { std::mem::zeroed() };
     info.size = size_of::<OpenFile>() as u32;
     info.owner = window;
@@ -1654,7 +1857,10 @@ pub fn file_dialog(window: Handle, save: bool, suggestion: &OsStr) -> io::Result
         return if error == 0 {
             Ok(Vec::new())
         } else {
-            Err(io::Error::other(format!("파일 선택 실패 ({error:#x})")))
+            Err(io::Error::other(crate::i18n::message(
+                "ui.file.selection.failed",
+                &[format!("{:#x}", error)],
+            )))
         };
     }
     let mut parts = buffer
@@ -1694,8 +1900,9 @@ pub fn folder_dialog(
         if result >= 0 {
             Ok(())
         } else {
-            Err(io::Error::other(format!(
-                "폴더 선택을 열 수 없습니다. ({result:#x})"
+            Err(io::Error::other(crate::i18n::message(
+                "ui.could.not.open.the.folder.picker",
+                &[format!("{:#x}", result)],
             )))
         }
     }

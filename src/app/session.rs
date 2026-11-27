@@ -152,7 +152,9 @@ impl App {
             Ok(state) => state,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
             Err(_) => {
-                self.report("이전 작업 상태를 읽을 수 없습니다.");
+                self.report(crate::i18n::text(
+                    "ui.could.not.read.the.previous.workspace.state",
+                ));
                 return false;
             }
         };
@@ -260,14 +262,19 @@ impl App {
         }
         self.update_status();
         if skipped > 0 {
-            self.report(&format!("열 수 없는 파일 {skipped}개를 건너뛰었습니다."));
+            self.report(&crate::i18n::message(
+                "ui.skipped.files.that.could.not.be.opened",
+                &[(skipped).to_string()],
+            ));
         }
         state.window.is_some_and(|window| window.maximized)
     }
 
     pub(super) fn prepare_session_exit(&mut self) -> bool {
         if self.explorer.archive.is_extracting() {
-            self.report("압축 풀기가 끝난 뒤 창을 닫을 수 있습니다.");
+            self.report(crate::i18n::text(
+                "ui.you.can.close.the.window.when.extraction",
+            ));
             return false;
         }
         if self.detached {
@@ -276,8 +283,9 @@ impl App {
         match self.save_session() {
             Ok(()) => true,
             Err(error) => {
-                self.show_error(io::Error::other(format!(
-                    "이전 작업 상태를 저장할 수 없습니다. {error}"
+                self.show_error(io::Error::other(crate::i18n::message(
+                    "ui.could.not.save.the.previous.workspace.state",
+                    &[(error).to_string()],
                 )));
                 self.confirm_exit()
             }
@@ -295,7 +303,11 @@ fn session_path(doc: &Document) -> Option<&Path> {
 fn session_file() -> io::Result<PathBuf> {
     std::env::var_os("LOCALAPPDATA")
         .map(|path| PathBuf::from(path).join("Maker").join("session.bin"))
-        .ok_or_else(|| io::Error::other("작업 상태를 저장할 폴더가 없습니다."))
+        .ok_or_else(|| {
+            io::Error::other(crate::i18n::text(
+                "ui.there.is.no.folder.for.saving.workspace",
+            ))
+        })
 }
 
 fn invalid() -> io::Error {

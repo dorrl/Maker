@@ -14,6 +14,8 @@ pub(super) const DOCK_BOTTOM: usize = 143;
 pub(super) const DOCK_LEFT: usize = 144;
 pub(super) const DOCK_RIGHT: usize = 145;
 pub(super) const CLOSE_TAB: usize = 146;
+pub(super) const SIDEBAR_VIEW: usize = 409;
+pub(super) const DOCK_SIDEBAR: usize = 410;
 pub(super) const MENU: usize = 147;
 pub(super) const TIMER: usize = 3;
 const HEADER: usize = 340;
@@ -87,20 +89,25 @@ impl Tab {
                     updated = true;
                 }
                 Ok(Event::Exit(code)) => {
-                    self.screen
-                        .note(&format!("셸이 종료되었습니다. (코드 {code})"));
+                    self.screen.note(&crate::i18n::message(
+                        "ui.the.shell.exited.code",
+                        &[(code).to_string()],
+                    ));
                     self.session = None;
                     updated = true;
                 }
                 Ok(Event::Error(error)) => {
-                    self.screen
-                        .note(&format!("셸을 시작할 수 없습니다. {error}"));
+                    self.screen.note(&crate::i18n::message(
+                        "ui.could.not.start.the.shell",
+                        std::slice::from_ref(&error),
+                    ));
                     self.session = None;
                     updated = true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.screen.note("셸 연결이 종료되었습니다.");
+                    self.screen
+                        .note(crate::i18n::text("ui.the.shell.disconnected"));
                     self.session = None;
                     updated = true;
                 }
@@ -158,6 +165,8 @@ enum BodyDrag {
 
 pub(super) struct Panel {
     header: Handle,
+    pub(super) sidebar_button: Handle,
+    sidebar_revealing: bool,
     body: Handle,
     divider: Handle,
     pub(super) visible: bool,
@@ -187,6 +196,10 @@ impl Drop for Panel {
 }
 
 impl Panel {
+    pub(super) fn is_empty(&self) -> bool {
+        self.tabs.is_empty()
+    }
+
     pub(super) fn saved(&self) -> SavedPanel {
         SavedPanel {
             visible: self.visible,
@@ -205,10 +218,38 @@ impl Panel {
         }
     }
     pub(super) fn new(window: Handle) -> io::Result<Self> {
+        let sidebar_button = child(
+            window,
+            SIDEBAR_VIEW,
+            "BUTTON",
+            crate::i18n::text("ui.sidebar.terminal"),
+            BS_OWNERDRAW | WS_TABSTOP,
+        )?;
+        chrome::watch_control(sidebar_button, true);
         Ok(Self {
-            header: child(window, HEADER, CLASS, "터미널 탭", 0)?,
-            body: child(window, BODY, CLASS, "터미널", WS_TABSTOP)?,
-            divider: child(window, DIVIDER, CLASS, "터미널 경계", 0)?,
+            header: child(
+                window,
+                HEADER,
+                CLASS,
+                crate::i18n::text("ui.terminal.tab"),
+                0,
+            )?,
+            sidebar_button,
+            sidebar_revealing: false,
+            body: child(
+                window,
+                BODY,
+                CLASS,
+                crate::i18n::text("ui.terminal"),
+                WS_TABSTOP,
+            )?,
+            divider: child(
+                window,
+                DIVIDER,
+                CLASS,
+                crate::i18n::text("ui.terminal.divider"),
+                0,
+            )?,
             visible: false,
             area: Rect::default(),
             font: 0,
@@ -375,9 +416,54 @@ impl App {
         self.activate_terminal(active);
     }
 
+    pub(super) fn terminal_in_sidebar(&self) -> bool {
+        self.terminal.visible && self.settings.terminal_dock == TerminalDock::Sidebar
+    }
+
+    pub(super) fn leave_sidebar_terminal(&mut self) {
+        if self.terminal_in_sidebar() {
+            self.terminal.visible = false;
+            self.terminal.sidebar_revealing = false;
+        }
+    }
+
+    pub(super) fn terminal_sidebar_area(&self) -> Rect {
+        self.dock.terminal_sidebar
+    }
+
+    fn sidebar_terminal_key(&self) -> motion::Key {
+        motion::Key::control(self.terminal.header, motion::Effect::Reveal)
+    }
+
+    pub(super) fn refresh_sidebar_terminal_reveal(&mut self) {
+        if self.terminal.sidebar_revealing {
+            self.terminal.sidebar_revealing = motion::active(self.sidebar_terminal_key());
+            self.terminal_layout(self.terminal.area);
+        }
+    }
+
+    fn dock_terminal_in_sidebar(&mut self) -> io::Result<()> {
+        self.sidebar = true;
+        self.settings.terminal_dock = TerminalDock::Sidebar;
+        self.terminal.sidebar_revealing = false;
+        if self.terminal.is_empty() {
+            self.add_terminal(Shell::PowerShell)?;
+        } else {
+            self.terminal.visible = true;
+            self.layout();
+            self.activate_terminal(self.terminal.active);
+        }
+        let key = self.sidebar_terminal_key();
+        motion::animate(self.window, key, motion::Area::Control, false, true);
+        self.terminal.sidebar_revealing = motion::active(key);
+        self.terminal_layout(self.terminal.area);
+        self.settings.save()
+    }
+
     pub(super) fn terminal_layout(&mut self, area: Rect) -> Rect {
         self.terminal.area = area;
-        if !self.terminal.visible {
+        let sidebar = self.terminal_sidebar_area();
+        if !self.terminal.visible || self.terminal_in_sidebar() && sidebar.width() <= 0 {
             for handle in [
                 self.terminal.header,
                 self.terminal.body,
@@ -393,6 +479,20 @@ impl App {
         let size = self.terminal_extent(dock, area);
         let fills_window = self.detached && self.documents.is_empty();
         let (panel, edge, editor) = match dock {
+            TerminalDock::Sidebar => {
+                let progress = motion::value(self.sidebar_terminal_key(), true);
+                let height = ((sidebar.height() as f32 * progress) as i32)
+                    .max(header + self.px(3))
+                    .min(sidebar.height());
+                (
+                    Rect {
+                        bottom: sidebar.top + height,
+                        ..sidebar
+                    },
+                    Rect::default(),
+                    area,
+                )
+            }
             _ if fills_window => (
                 area,
                 Rect::default(),
@@ -458,14 +558,16 @@ impl App {
         );
         show(self.terminal.header, true);
         show(self.terminal.body, panel.height() > header);
-        if fills_window {
+        if fills_window || dock == TerminalDock::Sidebar {
             show(self.terminal.divider, false);
         } else {
             show_overlay(self.terminal.divider, edge);
         }
         self.terminal.reveal_tab(self.dpi);
         let size = self.terminal.inner_size(self.dpi);
-        if let Some(tab) = self.terminal.active_mut() {
+        if !self.terminal.sidebar_revealing
+            && let Some(tab) = self.terminal.active_mut()
+        {
             tab.resize(size);
         }
         self.redraw_terminal();
@@ -488,7 +590,15 @@ impl App {
 
     pub(super) fn terminal_command(&mut self, id: usize) -> io::Result<()> {
         match id {
-            TOGGLE if self.terminal.visible => self.hide_terminal(),
+            SIDEBAR_VIEW if self.terminal_in_sidebar() => self.hide_terminal(),
+            TOGGLE if self.terminal.visible && (!self.terminal_in_sidebar() || self.sidebar) => {
+                self.hide_terminal()
+            }
+            TOGGLE if self.settings.terminal_dock == TerminalDock::Sidebar => {
+                self.dock_terminal_in_sidebar()?
+            }
+            SIDEBAR_VIEW | DOCK_SIDEBAR => self.dock_terminal_in_sidebar()?,
+
             TOGGLE if !self.terminal.tabs.is_empty() => {
                 self.terminal.visible = true;
                 self.layout();
@@ -522,6 +632,9 @@ impl App {
                     .map(Path::to_owned)
             })
             .map_or_else(std::env::current_dir, Ok)?;
+        if self.settings.terminal_dock == TerminalDock::Sidebar {
+            self.sidebar = true;
+        }
         self.terminal.visible = true;
         self.layout();
         self.push_terminal(shell, directory, true);
@@ -613,17 +726,27 @@ impl App {
         match result {
             Ok(()) => {
                 self.after_terminal_removed(index);
+                self.close_empty_after_move();
                 Ok(())
             }
             Err(dock::Transfer::Terminal(tab)) => {
                 self.terminal.tabs.insert(index, *tab);
-                Err(io::Error::other("터미널을 대상 창으로 옮길 수 없습니다."))
+                Err(io::Error::other(crate::i18n::text(
+                    "ui.could.not.move.the.terminal.to.the",
+                )))
             }
             Err(_) => unreachable!("only terminal transfers sent here"),
         }
     }
 
     pub(super) fn accept_terminal(&mut self, tab: Tab) {
+        if self.settings.terminal_dock == TerminalDock::Sidebar {
+            if self.detached && self.documents.is_empty() {
+                self.settings.terminal_dock = TerminalDock::Bottom;
+            } else {
+                self.sidebar = true;
+            }
+        }
         self.terminal.visible = true;
         self.terminal.next_number += 1;
         self.terminal.tabs.push(tab);
@@ -892,6 +1015,7 @@ impl App {
                             TerminalDock::Bottom => drag.anchor.y - point.y,
                             TerminalDock::Left => point.x - drag.anchor.x,
                             TerminalDock::Right => drag.anchor.x - point.x,
+                            TerminalDock::Sidebar => return,
                         };
                         let size = (drag.value + delta).max(0) * 96 / self.dpi;
                         match target {
@@ -951,6 +1075,13 @@ impl App {
         ))
     }
 
+    fn sidebar_drop_from(&self, header: Handle, point: Point) -> bool {
+        self.sidebar
+            && self
+                .terminal_sidebar_area()
+                .has(map_point(header, self.window, point))
+    }
+
     fn terminal_header_mouse(&mut self, msg: u32, wp: usize, point: Point) {
         let header = self.terminal.header;
         let rect = bounds(header);
@@ -960,6 +1091,8 @@ impl App {
                 WM_MOUSEMOVE if moved => {
                     if rect.has(point) || self.transfer_target(header, point).is_some() {
                         self.clear_dock();
+                    } else if self.sidebar_drop_from(header, point) {
+                        self.show_dock(dock::Destination::TerminalSidebar);
                     } else {
                         self.show_dock(dock::Destination::Window);
                     }
@@ -970,13 +1103,17 @@ impl App {
                     unsafe {
                         ReleaseCapture();
                     }
-                    if moved
-                        && !rect.has(point)
-                        && index < self.terminal.tabs.len()
-                        && let Err(error) =
-                            self.detach_terminal(index, self.transfer_target(header, point))
-                    {
-                        self.show_error(error);
+                    if moved && !rect.has(point) && index < self.terminal.tabs.len() {
+                        let destination = self.transfer_target(header, point);
+                        let result =
+                            if destination.is_none() && self.sidebar_drop_from(header, point) {
+                                self.dock_terminal_in_sidebar()
+                            } else {
+                                self.detach_terminal(index, destination)
+                            };
+                        if let Err(error) = result {
+                            self.show_error(error);
+                        }
                     }
                     return;
                 }
@@ -1047,7 +1184,8 @@ impl App {
                         1 => match self.settings.terminal_dock {
                             TerminalDock::Bottom => DOCK_RIGHT,
                             TerminalDock::Right => DOCK_LEFT,
-                            TerminalDock::Left => DOCK_BOTTOM,
+                            TerminalDock::Left => DOCK_SIDEBAR,
+                            TerminalDock::Sidebar => DOCK_BOTTOM,
                         },
                         _ => TOGGLE,
                     };
@@ -1178,7 +1316,7 @@ impl App {
             draw_label(
                 dc,
                 Rect::from_size(self.px(10), 0, left - self.px(10), rect.height()),
-                "터미널",
+                crate::i18n::text("ui.terminal"),
                 palette.font,
                 palette.muted,
                 false,
@@ -1349,7 +1487,7 @@ impl App {
                     (end - col) as i32 * cell.x,
                     cell.y,
                 );
-                let (fg, bg) = colors(current.style, palette, self.settings.dark);
+                let (fg, bg) = colors(current.style, palette, self.settings.dark());
                 if selected {
                     fill(dc, cell_rect, palette.selected);
                 } else if bg != palette.editor_rgb {

@@ -102,13 +102,13 @@ impl Graph {
         chrome::watch_control(list, false);
         Ok(Self {
             list,
-            branch: button(GRAPH_BRANCH, "커밋 · HEAD ▾")?,
-            compare: button(GRAPH_COMPARE, "비교 · 자동 ▾")?,
+            branch: button(GRAPH_BRANCH, crate::i18n::text("ui.commits.head"))?,
+            compare: button(GRAPH_COMPARE, crate::i18n::text("ui.compare.auto"))?,
             header: child(
                 window,
                 HEADER,
                 "STATIC",
-                "커밋 그래프",
+                crate::i18n::text("ui.commit.graph"),
                 SS_CENTERIMAGE | SS_NOPREFIX,
             )?,
             query: Query::default(),
@@ -141,7 +141,15 @@ impl Graph {
         send(self.list, LB_SETITEMHEIGHT, 0, row_height as isize);
     }
 
-    fn populate(&self) {
+    pub(super) fn refresh_locale(&self) {
+        title(self.header, i18n::text("ui.commit.graph"));
+        self.refresh_ref_labels();
+        if self.history.rows.is_empty() {
+            self.populate_rows();
+        }
+    }
+
+    fn refresh_ref_labels(&self) {
         let display = |name: &str| {
             self.history
                 .branches
@@ -155,21 +163,40 @@ impl Graph {
             .as_deref()
             .map_or("HEAD".to_owned(), display);
         let compare = match &self.query.comparison {
-            Comparison::Automatic => "자동".into(),
-            Comparison::None => "없음".into(),
+            Comparison::Automatic => crate::i18n::text("ui.auto").into(),
+            Comparison::None => crate::i18n::text("ui.none").into(),
             Comparison::Ref(name) => display(name),
         };
-        title(self.branch, &format!("커밋 · {branch} ▾"));
-        title(self.compare, &format!("비교 · {compare} ▾"));
+        title(
+            self.branch,
+            &crate::i18n::message("ui.commits", std::slice::from_ref(&branch)),
+        );
+        title(
+            self.compare,
+            &crate::i18n::message("ui.compare", std::slice::from_ref(&compare)),
+        );
+    }
+
+    fn populate(&self) {
+        self.refresh_ref_labels();
+        self.populate_rows();
+    }
+
+    fn populate_rows(&self) {
         chrome::reset_file_motion(self.list);
         let top = send(self.list, LB_GETTOPINDEX, 0, 0).max(0) as usize;
         let selected = list_caret(self.list);
-        painting(self.list, false);
+        let visible = unsafe { IsWindowVisible(self.list) != 0 };
+        if visible {
+            painting(self.list, false);
+        }
         send(self.list, LB_RESETCONTENT, 0, 0);
         if self.history.rows.is_empty() {
             list_entry(
                 self.list,
-                self.notice.as_deref().unwrap_or("표시할 커밋이 없습니다."),
+                self.notice
+                    .as_deref()
+                    .unwrap_or(crate::i18n::text("ui.no.commits.to.display")),
                 0,
             );
         }
@@ -185,7 +212,9 @@ impl Graph {
             top.min(self.history.rows.len().saturating_sub(1)),
             0,
         );
-        painting(self.list, true);
+        if visible {
+            painting(self.list, true);
+        }
         repaint(self.list);
     }
 }
@@ -254,7 +283,9 @@ impl App {
                     graph.work = None;
                     if relevant {
                         let result = result.unwrap_or_else(|_| {
-                            Err(io::Error::other("그래프 작업이 종료되었습니다."))
+                            Err(io::Error::other(crate::i18n::text(
+                                "ui.the.graph.operation.ended",
+                            )))
                         });
                         match result {
                             Ok(history) => {
@@ -312,12 +343,12 @@ impl App {
         let graph = &mut self.git.graph;
         let mut names = vec![String::new()];
         let mut options = vec![if button == GRAPH_BRANCH {
-            "HEAD · 현재 브랜치".to_owned()
+            crate::i18n::text("ui.head.current.branch").to_owned()
         } else {
-            "자동 · 업스트림".to_owned()
+            crate::i18n::text("ui.auto.upstream").to_owned()
         }];
         if button == GRAPH_COMPARE {
-            options.push("비교 안 함".into());
+            options.push(crate::i18n::text("ui.no.comparison").into());
             names.push(String::new());
         }
         for branch in graph

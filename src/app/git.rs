@@ -27,6 +27,10 @@ pub(super) const REF_PICK_END: usize = 2399;
 pub(super) const READY: u32 = 0x8004;
 const MAX_DIFF: usize = 2 * 1024 * 1024;
 
+thread_local! {
+    static SIDEBAR_APPEARANCE: Cell<(usize, bool)> = const { Cell::new((EXPLORER_VIEW, false)) };
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Change {
     pub path: PathBuf,
@@ -80,7 +84,22 @@ pub(super) struct Panel {
     pending_preview: Option<Operation>,
     pending: Option<Operation>,
     next_scan: Instant,
-    notice: Option<String>,
+    notice: Option<Notice>,
+}
+
+#[derive(PartialEq, Eq)]
+enum Notice {
+    NoRepository,
+    GitError(String),
+}
+
+impl Notice {
+    fn text(&self) -> &str {
+        match self {
+            Self::NoRepository => i18n::text("ui.no.git.repository.found"),
+            Self::GitError(details) => details,
+        }
+    }
 }
 
 impl Panel {
@@ -97,16 +116,16 @@ impl Panel {
             "",
             WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
         )?;
-        edit_hint(message, "커밋 메시지");
+        edit_hint(message, crate::i18n::text("ui.commit.message"));
         Ok(Self {
             open: false,
-            explorer: button(EXPLORER_VIEW, "탐색기")?,
-            changes: button(CHANGES_VIEW, "소스 제어")?,
+            explorer: button(EXPLORER_VIEW, crate::i18n::text("ui.explorer"))?,
+            changes: button(CHANGES_VIEW, crate::i18n::text("ui.source.control"))?,
             message,
             graph: graph::Graph::new(window)?,
-            commit: button(COMMIT, "커밋")?,
-            stage: button(STAGE, "+ 스테이지")?,
-            unstage: button(UNSTAGE, "− 해제")?,
+            commit: button(COMMIT, crate::i18n::text("ui.commit"))?,
+            stage: button(STAGE, crate::i18n::text("ui.stage"))?,
+            unstage: button(UNSTAGE, crate::i18n::text("ui.unstage"))?,
             refresh: button(REFRESH, "⟳")?,
             root: None,
             snapshot: None,
@@ -147,7 +166,9 @@ impl Panel {
 
     fn start(&mut self, window: Handle, root: PathBuf, operation: Operation) -> io::Result<()> {
         if self.job.is_some() {
-            return Err(io::Error::other("Git 작업이 진행 중입니다."));
+            return Err(io::Error::other(crate::i18n::text(
+                "ui.a.git.operation.is.running",
+            )));
         }
         let known = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone());
         self.job = Some(spawn_job(window, root, known, operation)?);
@@ -179,11 +200,102 @@ fn spawn_job(
     })
 }
 
+pub(super) fn paint_sidebar_tab(item: &DrawItem, palette: Paint) {
+    let is_git = item.id as usize == CHANGES_VIEW;
+    let terminal = item.id as usize == terminal::SIDEBAR_VIEW;
+    let (active_view, sidebar_right) = SIDEBAR_APPEARANCE.get();
+    let active = active_view == item.id as usize;
+    let p = |px| px * palette.dpi / 96;
+    let emphasis = motion::value(
+        motion::Key::control(item.window, motion::Effect::Selected),
+        active,
+    );
+    let tint = chrome::button_tint(item, palette, palette.chrome_rgb, active);
+    fill_color(item.dc, item.rect, tint);
+    if emphasis > 0.0 {
+        let mut accent = item.rect;
+        if sidebar_right {
+            accent.left = accent.right - p(2);
+        } else {
+            accent.right = accent.left + p(2);
+        }
+        fill_color(item.dc, accent, motion::mix(tint, palette.accent, emphasis));
+    }
+    if terminal {
+        draw_label(
+            item.dc,
+            item.rect,
+            ">_",
+            palette.font,
+            if active {
+                palette.accent
+            } else {
+                palette.muted
+            },
+            true,
+        );
+        return;
+    }
+    let center = (item.rect.left + item.rect.right) / 2;
+    let middle = (item.rect.top + item.rect.bottom) / 2;
+    let stroke = |x, y, width, height| {
+        fill_color(
+            item.dc,
+            Rect::from_size(
+                center + p(x),
+                middle + p(y),
+                p(width).max(1),
+                p(height).max(1),
+            ),
+            motion::mix(palette.foreground, palette.accent, emphasis),
+        );
+    };
+    if is_git {
+        stroke(-5, -5, 1, 11);
+        stroke(-4, 0, 8, 1);
+        stroke(3, -5, 1, 6);
+        for (x, y) in [(-7, -8), (-7, 4), (1, -8)] {
+            stroke(x, y, 5, 5);
+        }
+    } else {
+        stroke(-7, -5, 1, 12);
+        stroke(-6, 6, 9, 1);
+        stroke(-4, -8, 1, 12);
+        stroke(-3, -8, 9, 1);
+        stroke(5, -8, 1, 12);
+        stroke(-4, 3, 10, 1);
+    }
+}
+
 impl App {
+    pub(super) fn refresh_git_locale(&self) {
+        for (window, key) in [
+            (self.git.commit, "ui.commit"),
+            (self.git.stage, "ui.stage"),
+            (self.git.unstage, "ui.unstage"),
+        ] {
+            title(window, i18n::text(key));
+        }
+        edit_hint(self.git.message, i18n::text("ui.commit.message"));
+        self.git.graph.refresh_locale();
+    }
+
     pub(super) fn layout_sidebar_tabs(&self, area: Rect) {
-        for (index, tab) in [self.git.explorer, self.git.changes]
-            .into_iter()
-            .enumerate()
+        let active = if self.terminal_in_sidebar() {
+            terminal::SIDEBAR_VIEW
+        } else if self.git.open {
+            CHANGES_VIEW
+        } else {
+            EXPLORER_VIEW
+        };
+        SIDEBAR_APPEARANCE.set((active, self.settings.sidebar_right));
+        for (index, tab) in [
+            self.git.explorer,
+            self.git.changes,
+            self.terminal.sidebar_button,
+        ]
+        .into_iter()
+        .enumerate()
         {
             place(
                 tab,
@@ -196,58 +308,8 @@ impl App {
         }
     }
 
-    pub(super) fn paint_sidebar_tab(&self, item: &DrawItem, palette: Paint) {
-        let is_git = item.id as usize == CHANGES_VIEW;
-        let active = self.git.open == is_git;
-        let emphasis = motion::value(
-            motion::Key::control(item.window, motion::Effect::Selected),
-            active,
-        );
-        let tint = chrome::button_tint(item, palette, palette.chrome_rgb, active);
-        fill_color(item.dc, item.rect, tint);
-        if emphasis > 0.0 {
-            let mut accent = item.rect;
-            if self.settings.sidebar_right {
-                accent.left = accent.right - self.px(2);
-            } else {
-                accent.right = accent.left + self.px(2);
-            }
-            fill_color(item.dc, accent, motion::mix(tint, palette.accent, emphasis));
-        }
-        let center = (item.rect.left + item.rect.right) / 2;
-        let middle = (item.rect.top + item.rect.bottom) / 2;
-        let p = |px| self.px(px);
-        let stroke = |x, y, width, height| {
-            fill_color(
-                item.dc,
-                Rect::from_size(
-                    center + p(x),
-                    middle + p(y),
-                    p(width).max(1),
-                    p(height).max(1),
-                ),
-                motion::mix(palette.foreground, palette.accent, emphasis),
-            );
-        };
-        if is_git {
-            stroke(-5, -5, 1, 11);
-            stroke(-4, 0, 8, 1);
-            stroke(3, -5, 1, 6);
-            for (x, y) in [(-7, -8), (-7, 4), (1, -8)] {
-                stroke(x, y, 5, 5);
-            }
-        } else {
-            stroke(-7, -5, 1, 12);
-            stroke(-6, 6, 9, 1);
-            stroke(-4, -8, 1, 12);
-            stroke(-3, -8, 9, 1);
-            stroke(5, -8, 1, 12);
-            stroke(-4, 3, 10, 1);
-        }
-    }
-
     pub(super) fn layout_git_controls(&self, area: Rect, header: i32) -> i32 {
-        let show_git = self.sidebar && self.git.open;
+        let show_git = self.sidebar && self.git.open && !self.terminal_in_sidebar();
         let show_actions = show_git && self.git.snapshot.is_some();
         let gap = self.px(5);
         let margin = self.px(7);
@@ -287,6 +349,7 @@ impl App {
     }
 
     pub(super) fn set_git_view(&mut self, open: bool) {
+        self.leave_sidebar_terminal();
         let previous = self.git.open;
         self.sidebar = true;
         self.git.open = open;
@@ -348,9 +411,9 @@ impl App {
             let result = match job.result.try_recv() {
                 Ok(result) => result,
                 Err(mpsc::TryRecvError::Empty) => return,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    Err(io::Error::other("Git 작업이 종료되었습니다."))
-                }
+                Err(mpsc::TryRecvError::Disconnected) => Err(io::Error::other(crate::i18n::text(
+                    "ui.the.git.operation.ended",
+                ))),
             };
             let root = job.root.clone();
             let background = job.background;
@@ -365,7 +428,7 @@ impl App {
                         self.git.notice = None;
                         if committed {
                             title(self.git.message, "");
-                            self.report("커밋했습니다.");
+                            self.report(crate::i18n::text("ui.committed"));
                             self.git.graph.invalidate();
                         }
                         if self.git.open && changed {
@@ -376,7 +439,7 @@ impl App {
                         }
                     }
                     Ok(Reply::Empty) => {
-                        let notice = "Git 저장소가 없습니다.".to_owned();
+                        let notice = Notice::NoRepository;
                         if self.git.snapshot.take().is_some()
                             || self.git.notice.as_ref() != Some(&notice)
                         {
@@ -389,7 +452,7 @@ impl App {
                     }
                     Err(error) => {
                         if background {
-                            let notice = error.to_string();
+                            let notice = Notice::GitError(error.to_string());
                             if self.git.snapshot.take().is_some()
                                 || self.git.notice.as_ref() != Some(&notice)
                             {
@@ -429,6 +492,7 @@ impl App {
     }
 
     pub(super) fn show_git_items(&mut self) {
+        let top = send(self.list, LB_GETTOPINDEX, 0, 0).max(0) as usize;
         let selected: Vec<_> = list_selection(self.list)
             .into_iter()
             .filter_map(|row| match self.list_items.get(row) {
@@ -440,7 +504,10 @@ impl App {
         if let Some(snapshot) = &self.git.snapshot {
             title(
                 self.sidebar_title,
-                &format!("소스 제어 · {}", snapshot.branch),
+                &crate::i18n::message(
+                    "ui.source.control_2",
+                    std::slice::from_ref(&snapshot.branch),
+                ),
             );
             for staged in [true, false] {
                 let matches: Vec<_> = snapshot
@@ -450,24 +517,26 @@ impl App {
                     .cloned()
                     .collect();
                 let label = if staged {
-                    "스테이징된 변경"
+                    crate::i18n::text("ui.staged.changes")
                 } else {
-                    "변경 사항"
+                    crate::i18n::text("ui.changes")
                 };
                 items.push(ListItem::Group(format!("{label} ({})", matches.len())));
                 items.extend(matches.into_iter().map(ListItem::Git));
             }
         } else {
-            title(self.sidebar_title, "소스 제어");
-            items.push(ListItem::Group(self.git.notice.clone().unwrap_or_else(
+            title(self.sidebar_title, crate::i18n::text("ui.source.control"));
+            let caption = self.git.notice.as_ref().map_or_else(
                 || {
                     if self.root.is_none() {
-                        "작업 폴더를 열어 주세요.".into()
+                        i18n::text("ui.open.a.workspace.folder")
                     } else {
-                        "변경 사항 확인 중…".into()
+                        i18n::text("ui.checking.for.changes")
                     }
                 },
-            )));
+                Notice::text,
+            );
+            items.push(ListItem::Group(caption.to_owned()));
         }
         self.set_list(items);
         let found: Vec<_> = self
@@ -491,6 +560,12 @@ impl App {
                 list_mark(self.list, row);
             }
         }
+        send(
+            self.list,
+            LB_SETTOPINDEX,
+            top.min(self.list_items.len().saturating_sub(1)),
+            0,
+        );
     }
 
     pub(super) fn git_action(&mut self, id: usize) -> io::Result<()> {
@@ -516,9 +591,9 @@ impl App {
                     .collect();
                 if changes.is_empty() {
                     self.report(if stage {
-                        "스테이지할 변경 파일을 선택하세요."
+                        crate::i18n::text("ui.select.changed.files.to.stage")
                     } else {
-                        "스테이징된 파일을 선택하세요."
+                        crate::i18n::text("ui.select.staged.files")
                     });
                 } else {
                     self.start_git_action(Operation::Index { changes, stage })?;
@@ -527,7 +602,7 @@ impl App {
             COMMIT => {
                 let message = caption(self.git.message);
                 if message.trim().is_empty() {
-                    self.report("커밋 메시지를 입력하세요.");
+                    self.report(crate::i18n::text("ui.enter.a.commit.message"));
                     unsafe {
                         SetFocus(self.git.message);
                     }
@@ -537,7 +612,7 @@ impl App {
                     .as_ref()
                     .is_some_and(|snapshot| snapshot.changes.iter().any(|change| change.staged))
                 {
-                    self.report("커밋할 파일을 먼저 스테이지하세요.");
+                    self.report(crate::i18n::text("ui.stage.the.files.you.want.to.commit"));
                 } else {
                     self.start_git_action(Operation::Commit(message))?;
                 }
@@ -575,9 +650,9 @@ impl App {
         let result = match job.result.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                Err(io::Error::other("Git 작업이 종료되었습니다."))
-            }
+            Err(mpsc::TryRecvError::Disconnected) => Err(io::Error::other(crate::i18n::text(
+                "ui.the.git.operation.ended",
+            ))),
         };
         let relevant = self.git.open && self.root.as_ref() == Some(&job.root);
         self.git.preview = None;
@@ -608,16 +683,15 @@ impl App {
     }
 
     fn start_git_action(&mut self, operation: Operation) -> io::Result<()> {
-        let root = self
-            .root
-            .clone()
-            .ok_or_else(|| io::Error::other("먼저 작업 폴더를 여세요."))?;
+        let root = self.root.clone().ok_or_else(|| {
+            io::Error::other(crate::i18n::text("ui.open.a.workspace.folder.first"))
+        })?;
         match &self.git.job {
             Some(_) if self.git.pending.is_none() => {
                 self.git.pending = Some(operation);
             }
             Some(_) => {
-                self.report("Git 작업이 진행 중입니다.");
+                self.report(crate::i18n::text("ui.a.git.operation.is.running"));
                 return Ok(());
             }
             None => self.git.start(self.window, root, operation)?,
@@ -633,9 +707,9 @@ impl App {
             "{} · {}",
             file_name(&change.path),
             if change.staged {
-                "스테이지"
+                crate::i18n::text("ui.stage_2")
             } else {
-                "Git 변경"
+                crate::i18n::text("ui.git.changes")
             }
         );
         let path = self.git.snapshot.as_ref().map_or_else(
@@ -806,10 +880,10 @@ fn diff_output(mut command: Command, differs_is_ok: bool) -> io::Result<String> 
             .replace("\r\n", "\n")
             .replace('\0', " ");
         if truncated {
-            text.push_str("\n… 변경 내용이 길어 일부만 표시했습니다.\n");
+            text.push_str(crate::i18n::text("ui.only.part.of.the.diff.is.shown"));
         }
         if text.is_empty() {
-            text = "표시할 텍스트 변경이 없습니다.".into();
+            text = crate::i18n::text("ui.no.text.changes.to.display").into();
         }
         Ok(text)
     })
@@ -828,7 +902,10 @@ fn git_path() -> io::Result<PathBuf> {
         .map(|dir| dir.join("git.exe"))
         .find(|file| file.is_file())
         .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "Git 실행 파일을 찾을 수 없습니다.")
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                crate::i18n::text("ui.could.not.find.the.git.executable"),
+            )
         })?;
     let _ = GIT_PATH.set(path.clone());
     Ok(path)
@@ -959,7 +1036,7 @@ fn command_error(output: &Output) -> io::Error {
     };
     let message: String = raw.trim().chars().take(950).collect();
     io::Error::other(if message.is_empty() {
-        format!("Git 작업 실패 ({})", output.status)
+        crate::i18n::message("ui.git.operation.failed", &[(output.status).to_string()])
     } else {
         message
     })

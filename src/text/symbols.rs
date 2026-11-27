@@ -177,9 +177,9 @@ impl Language {
 
 pub fn prepare(code: &str, cursor: usize, language: Language) -> io::Result<Rename> {
     if !language.can_rename() {
-        return Err(error(
-            "이 언어의 심볼 이름 바꾸기는 아직 지원하지 않습니다.",
-        ));
+        return Err(error(crate::i18n::text(
+            "ui.symbol.renaming.is.unavailable.for.this.language",
+        )));
     }
     let model = Model::new(code, language);
     let selected = model
@@ -192,10 +192,18 @@ pub fn prepare(code: &str, cursor: usize, language: Language) -> io::Result<Rena
                 .iter()
                 .position(|token| token.word && token.range.end == cursor)
         })
-        .ok_or_else(|| error("변수, 함수 또는 타입 이름에 커서를 놓으세요."))?;
+        .ok_or_else(|| {
+            error(crate::i18n::text(
+                "ui.place.the.caret.on.a.variable.function",
+            ))
+        })?;
     let binding = model
         .resolve(selected, None, model.tokens[selected].text)
-        .ok_or_else(|| error("이 파일에서 심볼의 선언을 찾을 수 없습니다."))?;
+        .ok_or_else(|| {
+            error(crate::i18n::text(
+                "ui.could.not.find.the.symbol.declaration.in",
+            ))
+        })?;
     let name = model.tokens[selected].text;
     let edits = model.references(binding, name);
     let selected = edits
@@ -218,7 +226,9 @@ pub fn prepare(code: &str, cursor: usize, language: Language) -> io::Result<Rena
 impl Rename {
     pub fn apply(&self, code: &str, new_name: &str, language: Language) -> io::Result<Change> {
         if !is_word(new_name, language) || reserved(language, new_name) {
-            return Err(error("해당 언어에서 사용할 수 있는 식별자를 입력하세요."));
+            return Err(error(crate::i18n::text(
+                "ui.enter.an.identifier.supported.by.this.language",
+            )));
         }
         let model = Model::new(code, language);
         let declaration = model
@@ -226,7 +236,9 @@ impl Rename {
             .iter()
             .position(|token| token.range.start == self.definition);
         let Some(binding) = declaration.and_then(|index| model.declarations[index]) else {
-            return Err(error("파일 내용이 바뀌었습니다. F2를 다시 눌러 주세요."));
+            return Err(error(crate::i18n::text(
+                "ui.the.file.changed.press.f2.again",
+            )));
         };
         let matches = model.references(binding, &self.name);
         if matches.len() != self.ranges.len()
@@ -235,7 +247,9 @@ impl Rename {
                 .zip(&self.ranges)
                 .any(|(index, range)| model.tokens[*index].range != *range)
         {
-            return Err(error("파일 내용이 바뀌었습니다. F2를 다시 눌러 주세요."));
+            return Err(error(crate::i18n::text(
+                "ui.the.file.changed.press.f2.again",
+            )));
         }
         let definition_scope = model.bindings[binding].scope;
         let renamed = Some((binding, new_name));
@@ -253,7 +267,9 @@ impl Rename {
                         != model.resolve(index, renamed, new_name)
             })
         {
-            return Err(error("같은 이름의 다른 심볼과 충돌합니다."));
+            return Err(error(crate::i18n::text(
+                "ui.this.conflicts.with.another.symbol.of.the",
+            )));
         }
         let first = self.ranges.first().expect("one edit").start;
         let end = self.ranges.last().expect("one edit").end;

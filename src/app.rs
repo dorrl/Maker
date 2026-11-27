@@ -13,7 +13,9 @@ mod session;
 mod terminal;
 
 use crate::{
+    i18n,
     text::{self, Color, Encoding, Language, Settings},
+    theme::Theme,
     win::*,
 };
 use std::{
@@ -49,12 +51,13 @@ const THIRD: usize = 308;
 const DISMISS: usize = 309;
 const HIGHLIGHT_LIMIT: usize = 160_000;
 const HIGHLIGHT_WINDOW: i32 = 24_000;
+const HIGHLIGHT_MARGIN: i32 = 256;
 const BUTTONS: &[(usize, &str, i32)] = &[
-    (FILE_MENU, "파일", 43),
-    (EDIT_MENU, "편집", 43),
-    (TOOLS, "보기", 43),
-    (terminal::MENU, "터미널", 62),
-    (PREFERENCES, "설정", 43),
+    (FILE_MENU, "ui.file", 43),
+    (EDIT_MENU, "ui.edit", 43),
+    (TOOLS, "ui.view", 43),
+    (terminal::MENU, "ui.terminal", 62),
+    (PREFERENCES, "ui.settings", 43),
 ];
 
 const NEW: usize = 100;
@@ -128,72 +131,30 @@ struct Paint {
     thumb_rgb: u32,
     thumb_hover_rgb: u32,
     icons: [u32; 6],
+    syntax_colors: [u32; 15],
     dpi: i32,
 }
 
 impl Paint {
-    fn new(dark: bool, dpi: i32) -> Self {
-        let (
-            background,
-            panel,
-            chrome,
-            menu,
-            control,
-            selected,
-            border,
-            accent,
-            thumb,
-            thumb_hover,
-            foreground,
-            muted,
-            icons,
-        ) = if dark {
-            (
-                rgb(24, 29, 35),
-                rgb(29, 35, 42),
-                rgb(32, 39, 46),
-                rgb(38, 46, 54),
-                rgb(48, 59, 68),
-                rgb(43, 62, 66),
-                rgb(48, 58, 65),
-                rgb(114, 219, 189),
-                rgb(83, 102, 108),
-                rgb(125, 158, 155),
-                rgb(231, 239, 241),
-                rgb(174, 190, 195),
-                [
-                    rgb(176, 191, 198),
-                    rgb(242, 163, 130),
-                    rgb(240, 202, 113),
-                    rgb(134, 196, 242),
-                    rgb(203, 176, 248),
-                    rgb(125, 214, 178),
-                ],
-            )
-        } else {
-            (
-                rgb(250, 252, 251),
-                rgb(235, 242, 241),
-                rgb(227, 236, 235),
-                rgb(245, 250, 249),
-                rgb(210, 226, 224),
-                rgb(205, 228, 221),
-                rgb(195, 215, 212),
-                rgb(14, 111, 86),
-                rgb(137, 170, 166),
-                rgb(86, 133, 127),
-                rgb(25, 48, 51),
-                rgb(69, 98, 101),
-                [
-                    rgb(79, 107, 112),
-                    rgb(153, 61, 32),
-                    rgb(127, 88, 15),
-                    rgb(27, 85, 143),
-                    rgb(107, 53, 154),
-                    rgb(14, 109, 78),
-                ],
-            )
-        };
+    fn highlight(self, color: Color) -> u32 {
+        self.syntax_colors[crate::theme::syntax_index(color)]
+    }
+
+    fn new(theme: Theme, dpi: i32) -> Self {
+        let colors = theme.palette();
+        let background = colors.get("background");
+        let panel = colors.get("panel");
+        let chrome = colors.get("chrome");
+        let menu = colors.get("menu");
+        let control = colors.get("control");
+        let selected = colors.get("selected");
+        let border = colors.get("border");
+        let accent = colors.get("accent");
+        let thumb = colors.get("thumb");
+        let thumb_hover = colors.get("thumb_hover");
+        let foreground = colors.get("foreground");
+        let muted = colors.get("muted");
+        let icons = colors.icons();
         Self {
             foreground,
             muted,
@@ -220,6 +181,7 @@ impl Paint {
             thumb_rgb: thumb,
             thumb_hover_rgb: thumb_hover,
             icons,
+            syntax_colors: colors.syntax(),
             dpi,
         }
     }
@@ -256,7 +218,6 @@ enum Mode {
     Workspace,
     Quick,
     Goto,
-    Font,
     Rename,
 }
 
@@ -282,6 +243,7 @@ struct Document {
     archive_member: Option<(PathBuf, PathBuf)>,
     browser: Option<browser::Browser>,
     response: bool,
+    response_url: Option<String>,
     data_view: Option<data_view::View>,
 }
 
@@ -329,7 +291,7 @@ enum ListItem {
     Issue {
         index: usize,
         line: usize,
-        description: &'static str,
+        kind: text::BracketIssue,
     },
     Git(git::Change),
     Group(String),
@@ -348,7 +310,7 @@ impl Drop for Search {
 struct App {
     window: Handle,
     toolbar: Vec<(Handle, i32)>,
-    data_buttons: [[Handle; 3]; 2],
+    data_buttons: [[Handle; 4]; 2],
     chrome: chrome::Chrome,
     dock: dock::Dock,
     secondary_browser: Option<browser::Browser>,
@@ -611,12 +573,16 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
         WM_TIMER => {
             if wp == motion::TIMER {
                 motion::tick(window);
-                with_app(App::finish_chrome_motion);
+                with_app(|app| {
+                    app.finish_chrome_motion();
+                    app.refresh_sidebar_terminal_reveal();
+                });
                 return 0;
             }
             with_app(|app| match wp {
                 COLOR_TIMER => app.repaint_editor(),
                 VIEWPORT_TIMER => app.repaint_viewport(),
+                chrome::SIDEBAR_RESIZE_TIMER => app.flush_sidebar_resize(),
                 COMPLETION_TIMER => app.tick_completion(),
                 SEARCH_TIMER => app.check_search(),
                 browser::TIMER => app.start_browser_searches(),
@@ -696,12 +662,21 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
             });
             return 0;
         }
-        WM_CTLCOLORSTATIC | WM_CTLCOLORLISTBOX | WM_CTLCOLOREDIT => {
+        WM_CTLCOLORSTATIC | WM_CTLCOLORLISTBOX | WM_CTLCOLOREDIT | WM_CTLCOLORBTN => {
             if let Some(palette) = PAINT.get() {
                 let id = unsafe { GetDlgCtrlID(lp) } as usize;
                 let (brush, background, foreground) = match id {
                     SIDEBAR_TITLE | LIST | git::GRAPH_LIST | browser::RESULTS => {
                         (palette.panel, palette.panel_rgb, palette.foreground)
+                    }
+                    git::EXPLORER_VIEW | git::CHANGES_VIEW | terminal::SIDEBAR_VIEW => {
+                        (palette.chrome, palette.chrome_rgb, palette.foreground)
+                    }
+                    explorer::NEW_FILE | explorer::NEW_FOLDER => {
+                        (palette.panel, palette.panel_rgb, palette.foreground)
+                    }
+                    _ if message == WM_CTLCOLORBTN => {
+                        (palette.control, palette.control_rgb, palette.foreground)
                     }
                     browser::QUERY_ID => (palette.control, palette.control_rgb, palette.foreground),
                     STATUS | LOCATION => (palette.chrome, palette.chrome_rgb, palette.muted),
@@ -727,8 +702,8 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                     explorer::NEW_FILE | explorer::NEW_FOLDER => {
                         explorer::paint_button(item, palette)
                     }
-                    git::EXPLORER_VIEW | git::CHANGES_VIEW => {
-                        with_app(|app| app.paint_sidebar_tab(item, palette));
+                    git::EXPLORER_VIEW | git::CHANGES_VIEW | terminal::SIDEBAR_VIEW => {
+                        git::paint_sidebar_tab(item, palette);
                     }
                     EDITOR_TOOLS => {
                         let shade = motion::value(
@@ -774,7 +749,7 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                                 item.rect.width(),
                                 px(24),
                             ),
-                            "Windows용 코드 편집기",
+                            crate::i18n::text("ui.code.editor.for.windows"),
                             palette.font,
                             palette.muted,
                             false,
@@ -782,10 +757,8 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                     }
                     LIST => chrome::paint_file_row(item, palette, palette.dpi),
                     git::GRAPH_LIST => {
-                        with_app(|app| app.paint_graph_row(item, palette));
-                    }
-                    GUTTER | OTHER_GUTTER => {
-                        with_app(|app| app.paint_gutter(item, palette));
+                        with_app(|app| app.paint_graph_row(item, palette))
+                            .unwrap_or_else(|| fill(item.dc, item.rect, palette.panel));
                     }
                     id => {
                         let toolbar = BUTTONS.iter().any(|button| button.0 == id);
@@ -804,8 +777,7 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                             palette.control_rgb
                         };
                         let tint = chrome::button_tint(item, palette, base, active);
-                        if toolbar
-                            || mode
+                        if mode
                             || matches!(
                                 id,
                                 browser::WORK_FOLDER | browser::OPEN_FILE | browser::RECENT_FILE
@@ -855,6 +827,8 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
 
 impl App {
     fn new(window: Handle) -> io::Result<Self> {
+        let settings = Settings::load();
+        i18n::select(settings.locale);
         let static_label =
             |id, label| child(window, id, "STATIC", label, SS_CENTERIMAGE | SS_NOPREFIX);
         let button = |id, label| -> io::Result<_> {
@@ -873,7 +847,7 @@ impl App {
         };
         let toolbar = BUTTONS
             .iter()
-            .map(|&(id, label, size)| Ok((button(id, label)?, size)))
+            .map(|&(id, label, size)| Ok((button(id, i18n::text(label))?, size)))
             .collect::<io::Result<Vec<_>>>()?;
         let mut app = Self {
             window,
@@ -886,7 +860,7 @@ impl App {
             terminal: terminal::Panel::new(window)?,
             explorer: explorer::Explorer::new(window)?,
             git: git::Panel::new(window)?,
-            sidebar_title: static_label(SIDEBAR_TITLE, "탐색기")?,
+            sidebar_title: static_label(SIDEBAR_TITLE, crate::i18n::text("ui.explorer"))?,
             list: child(
                 window,
                 LIST,
@@ -901,24 +875,30 @@ impl App {
                     | WS_TABSTOP
                     | WS_VSCROLL,
             )?,
-            gutter: child(window, GUTTER, "STATIC", "", 0xd)?,
-            other_gutter: child(window, OTHER_GUTTER, "STATIC", "", 0xd)?,
-            status: static_label(STATUS, "파일을 열거나 작업 폴더를 선택하세요.")?,
+            gutter: child(window, GUTTER, chrome::SURFACE, "", 0)?,
+            other_gutter: child(window, OTHER_GUTTER, chrome::SURFACE, "", 0)?,
+            status: static_label(
+                STATUS,
+                crate::i18n::text("ui.open.a.file.or.choose.a.workspace"),
+            )?,
             location: static_label(LOCATION, "")?,
             mode_label: static_label(0, "")?,
             editor_tools: child(window, EDITOR_TOOLS, "STATIC", "", 0x000d)?,
             welcome: child(window, WELCOME, "STATIC", "Maker", 0x000d)?,
             welcome_actions: [
-                button(WELCOME_OPEN, "파일 열기   Ctrl+O")?,
-                button(WELCOME_FOLDER, "폴더 열기   Ctrl+K Ctrl+O")?,
-                button(WELCOME_NEW, "새 파일   Ctrl+N")?,
+                button(WELCOME_OPEN, crate::i18n::text("ui.open.file.ctrl.o"))?,
+                button(
+                    WELCOME_FOLDER,
+                    crate::i18n::text("ui.open.folder.ctrl.k.ctrl.o"),
+                )?,
+                button(WELCOME_NEW, crate::i18n::text("ui.new.file.ctrl.n"))?,
             ],
             query: input(QUERY)?,
             replacement: input(REPLACEMENT)?,
             action: button(ACTION, "")?,
             second: button(SECOND, "")?,
             third: button(THIRD, "")?,
-            dismiss: button(DISMISS, "닫기")?,
+            dismiss: button(DISMISS, crate::i18n::text("ui.close"))?,
             documents: Vec::new(),
             active: None,
             other: None,
@@ -939,7 +919,7 @@ impl App {
             completion_pending: None,
             last_find: String::new(),
             search: None,
-            settings: Settings::load(),
+            settings,
             pending_chord: false,
             fresh_window: false,
             fullscreen: None,
@@ -951,6 +931,7 @@ impl App {
             DragAcceptFiles(window, 1);
         }
         chrome::watch_control(app.list, false);
+        app.refresh_locale_labels();
         app.apply_preferences();
         Ok(app)
     }
@@ -960,6 +941,14 @@ impl App {
     }
 
     fn layout(&mut self) {
+        self.layout_geometry();
+        self.refresh_tab();
+        repaint(self.gutter);
+        repaint(self.other_gutter);
+        repaint(self.window);
+    }
+
+    fn layout_geometry(&mut self) {
         let rect = bounds(self.window);
         let (width, height) = (rect.width(), rect.height());
         let bar = self.px(34);
@@ -1026,8 +1015,11 @@ impl App {
         let changes_bottom = self.layout_git_graph(sidebar_content, list_top);
         self.dock.sidebar_area =
             Rect::from_size(content_left, list_top, content_width, bottom - list_top);
+        self.dock.terminal_sidebar = sidebar_content;
+        let terminal_here = self.terminal_in_sidebar();
         let sidebar_middle = list_top + (bottom - list_top) * self.dock.sidebar_ratio / 100;
-        let can_split_sidebar = self.sidebar && !self.git.open && bottom - list_top >= self.px(120);
+        let can_split_sidebar =
+            self.sidebar && !terminal_here && !self.git.open && bottom - list_top >= self.px(120);
         self.dock.sidebar = if can_split_sidebar {
             Rect::from_size(
                 content_left,
@@ -1058,8 +1050,8 @@ impl App {
             step,
         );
         show(self.dock.sidebar_splitter, sidebar_split);
-        show(self.sidebar_title, self.sidebar);
-        show(self.list, self.sidebar);
+        show(self.sidebar_title, self.sidebar && !terminal_here);
+        show(self.list, self.sidebar && !terminal_here);
         self.layout_explorer_buttons(Rect::from_size(content_left, top, content_width, bar));
         if self.sidebar {
             show_overlay(
@@ -1165,10 +1157,6 @@ impl App {
         self.layout_explorer_edit();
         self.layout_input(width, bar + step);
         self.position_menu();
-        self.refresh_tab();
-        repaint(self.gutter);
-        repaint(self.other_gutter);
-        repaint(self.window);
     }
 
     fn group_document(&self, group: usize) -> Option<usize> {
@@ -1352,12 +1340,73 @@ impl App {
         }
     }
 
+    fn refresh_locale_labels(&mut self) {
+        for ((handle, width), &(_, key, minimum)) in self.toolbar.iter_mut().zip(BUTTONS) {
+            let text = i18n::text(key);
+            title(*handle, text);
+            *width = minimum.max(
+                13 + text
+                    .chars()
+                    .map(|ch| if ch.is_ascii() { 7 } else { 13 })
+                    .sum::<i32>(),
+            );
+        }
+        for (handle, key) in self.welcome_actions.into_iter().zip([
+            "ui.open.file.ctrl.o",
+            "ui.open.folder.ctrl.k.ctrl.o",
+            "ui.new.file.ctrl.n",
+        ]) {
+            title(handle, i18n::text(key));
+        }
+        for (handle, key) in [
+            (self.dismiss, "ui.close"),
+            (self.explorer.file, "ui.new.file"),
+            (self.explorer.folder, "ui.new.folder"),
+            (self.git.explorer, "ui.explorer"),
+            (self.git.changes, "ui.source.control"),
+            (self.terminal.sidebar_button, "ui.sidebar.terminal"),
+        ] {
+            title(handle, i18n::text(key));
+        }
+        self.refresh_git_locale();
+        for buttons in self.data_buttons {
+            for (button, key) in buttons.into_iter().zip([
+                "ui.source",
+                "data.pretty",
+                "ui.tree",
+                "ui.open.in.browser",
+            ]) {
+                title(button, i18n::text(key));
+            }
+        }
+        for doc in &mut self.documents {
+            if doc
+                .browser
+                .as_ref()
+                .is_some_and(|view| view.folder().is_none())
+            {
+                doc.label = i18n::text("ui.new.tab").to_owned();
+            }
+        }
+        if self.documents.is_empty() {
+            self.report(i18n::text("ui.open.a.file.or.choose.a.workspace"));
+        } else {
+            self.report("");
+        }
+        if self.git.open {
+            self.show_git_items();
+        } else if self.mode.is_none() && !self.showing_issues {
+            self.show_files("");
+        }
+        self.update_status();
+    }
+
     fn apply_preferences(&mut self) {
         self.terminal.font(self.dpi);
-        let paint = Paint::new(self.settings.dark, self.dpi);
+        let paint = Paint::new(self.settings.theme, self.dpi);
         title_theme(
             self.window,
-            self.settings.dark,
+            self.settings.dark(),
             paint.chrome_rgb,
             paint.foreground,
         );
@@ -1459,7 +1508,7 @@ impl App {
 
     fn blank_name(&mut self) -> String {
         self.untitled += 1;
-        format!("제목 없음 {}", self.untitled)
+        crate::i18n::message("ui.untitled", &[(self.untitled).to_string()])
     }
 
     fn new_document(&mut self) -> io::Result<()> {
@@ -1522,6 +1571,7 @@ impl App {
             archive_member: None,
             browser: None,
             response: false,
+            response_url: None,
             data_view: None,
         });
         self.format(index, true);
@@ -1545,9 +1595,9 @@ impl App {
         }
         let (code, encoding) = text::read(&path)?;
         if code.len() > 64 * 1024 * 1024 {
-            return Err(io::Error::other(
-                "64 MiB 이하의 텍스트 파일만 열 수 있습니다.",
-            ));
+            return Err(io::Error::other(crate::i18n::text(
+                "ui.maker.opens.text.files.up.to.64",
+            )));
         }
         let label = path
             .file_name()
@@ -1609,9 +1659,9 @@ impl App {
                 title(self.location, &view.base().display().to_string());
             } else if document.data_mode() != data_view::ViewMode::Raw {
                 let mode = if document.data_mode() == data_view::ViewMode::Pretty {
-                    "Pretty Print"
+                    i18n::text("data.pretty")
                 } else {
-                    "트리"
+                    crate::i18n::text("ui.tree")
                 };
                 title(
                     self.location,
@@ -1675,7 +1725,7 @@ impl App {
         }
         let size = editor_size(editor);
         let viewport = size > HIGHLIGHT_LIMIT && document.language != Language::Plain;
-        let region = viewport.then(|| {
+        let region = if viewport {
             let area = bounds(editor);
             let start = editor_character_at(editor, Point { x: 0, y: 0 });
             let end = editor_character_at(
@@ -1689,12 +1739,21 @@ impl App {
                     y: area.bottom.saturating_sub(1),
                 },
             )
-            .max(start + 1);
+            .max(start.saturating_add(1));
+            let limit = i32::try_from(size).unwrap_or(i32::MAX);
+            if !full
+                && !document.highlight_pending
+                && document.colored_view.is_some_and(|range| {
+                    range.start <= (start - HIGHLIGHT_MARGIN).max(0)
+                        && range.end >= end.saturating_add(HIGHLIGHT_MARGIN).min(limit)
+                })
+            {
+                return;
+            }
             let line = send(editor, 0x00c9, start as usize, 0).max(0) as usize;
             let end_line = send(editor, 0x00c9, end as usize, 0).max(0) as usize;
             let context_start = send(editor, 0x00bb, line.saturating_sub(60), 0).max(0) as i32;
             let context_end = send(editor, 0x00bb, end_line + 65, 0);
-            let limit = i32::try_from(size).unwrap_or(i32::MAX);
             let from = context_start
                 .max(start.saturating_sub(HIGHLIGHT_WINDOW / 3))
                 .max(0);
@@ -1703,11 +1762,13 @@ impl App {
             } else {
                 context_end as i32
             };
-            Selection {
+            Some(Selection {
                 start: from,
                 end: to.min(from.saturating_add(HIGHLIGHT_WINDOW)).min(limit),
-            }
-        });
+            })
+        } else {
+            None
+        };
         let current_view = document.colored_view;
         if !full && !document.highlight_pending && region == current_view {
             return;
@@ -1751,7 +1812,8 @@ impl App {
         if visible {
             painting(editor, false);
         }
-        let base = PAINT.get().expect("paint has been initialized").foreground;
+        let palette = PAINT.get().expect("paint has been initialized");
+        let base = palette.foreground;
         let range_color = hold.range_color();
         let set_color = |start, end, color| {
             if !range_color
@@ -1773,7 +1835,7 @@ impl App {
             set_color(
                 offset + range.start,
                 offset + range.end,
-                color.map_or(base, |color| highlight_color(color, self.settings.dark)),
+                color.map_or(base, |color| palette.highlight(color)),
             );
         }
         drop(range_color);
@@ -1831,7 +1893,7 @@ impl App {
     fn save_document(&mut self, index: usize, save_as: bool) -> io::Result<bool> {
         let document = &self.documents[index];
         if document.is_preview() || document.browser.is_some() {
-            self.report("미리 보기 탭은 읽기 전용입니다.");
+            self.report(crate::i18n::text("ui.preview.tabs.are.read.only"));
             return Ok(false);
         }
         let path = if let Some(path) = document.path.as_ref().filter(|_| !save_as) {
@@ -1857,7 +1919,9 @@ impl App {
                     .as_ref()
                     .is_some_and(|open| same_path(open, &path))
         }) {
-            return Err(io::Error::other("이미 다른 탭에서 열려 있는 파일입니다."));
+            return Err(io::Error::other(crate::i18n::text(
+                "ui.this.file.is.already.open.in.another",
+            )));
         }
         let editor = document.editor;
         let dirty = send(editor, EM_GETMODIFY, 0, 0) != 0;
@@ -1889,7 +1953,7 @@ impl App {
         }
         self.refresh_tab();
         self.update_status();
-        self.report("저장했습니다.");
+        self.report(crate::i18n::text("ui.saved"));
         self.request_git_refresh();
         Ok(true)
     }
@@ -1901,7 +1965,7 @@ impl App {
         }
         match message(
             self.window,
-            &format!("「{}」 파일의 변경 사항을 저장할까요?", document.label),
+            &crate::i18n::message("ui.save.changes.to", std::slice::from_ref(&document.label)),
             "Maker",
             MB_YESNOCANCEL | MB_ICONWARNING,
         ) {
@@ -2019,12 +2083,12 @@ impl App {
                 .cloned()
                 .map(|path| ListItem::File(path, None))
                 .collect();
-            title(self.sidebar_title, "빠른 파일 열기");
+            title(self.sidebar_title, crate::i18n::text("ui.quick.open"));
             self.set_list(items);
             return;
         }
         let label = self.root.as_deref().map_or_else(
-            || "탐색기".into(),
+            || crate::i18n::text("ui.explorer").into(),
             |root| {
                 root.file_name()
                     .unwrap_or(root.as_os_str())
@@ -2181,9 +2245,20 @@ impl App {
                     0,
                     chrome::file_icon(Some(path)),
                 ),
-                ListItem::Issue {
-                    line, description, ..
-                } => (format!("{}행  {description}", line + 1), 0, 13),
+                ListItem::Issue { line, kind, .. } => {
+                    let key = match kind {
+                        text::BracketIssue::Unclosed => "ui.unclosed.bracket",
+                        text::BracketIssue::UnmatchedClosing => "ui.unmatched.closing.bracket",
+                    };
+                    (
+                        i18n::message(
+                            "ui.line",
+                            &[(line + 1).to_string(), i18n::text(key).to_owned()],
+                        ),
+                        0,
+                        13,
+                    )
+                }
                 ListItem::Group(label) => (label.clone(), 0, 14),
                 ListItem::Git(change) => {
                     let marker = if change.kind == b'?' {
@@ -2327,7 +2402,9 @@ impl App {
                 self.archive_member(archive.clone(), path.clone(), *directory)?;
             }
             ListItem::File(path, _) if file_actions::executable(path) => {
-                self.report("실행 파일을 두 번 클릭하면 실행됩니다.");
+                self.report(crate::i18n::text(
+                    "ui.double.click.the.executable.to.run.it",
+                ));
             }
             ListItem::File(path, depth) => {
                 let path = path.clone();
@@ -2366,7 +2443,7 @@ impl App {
             return;
         }
         if self.root.is_none() {
-            self.report("먼저 작업 폴더를 여세요.");
+            self.report(crate::i18n::text("ui.open.a.workspace.folder.first"));
             return;
         }
         let paths = self.files.clone();
@@ -2381,9 +2458,9 @@ impl App {
         let flag = Arc::clone(&cancel);
         self.search = Some(Search { receiver, cancel });
         self.showing_issues = false;
-        title(self.sidebar_title, "작업 폴더 검색");
+        title(self.sidebar_title, crate::i18n::text("ui.search.workspace"));
         self.set_list(Vec::new());
-        self.report("검색 중…");
+        self.report(crate::i18n::text("ui.searching"));
         thread::spawn(move || {
             let mut hits = Vec::new();
             for path in paths {
@@ -2436,11 +2513,16 @@ impl App {
         };
         match search.receiver.try_recv() {
             Ok(items) => {
-                self.report(&format!("검색 결과 {}개", items.len()));
+                self.report(&crate::i18n::message(
+                    "ui.search.results",
+                    &[(items.len()).to_string()],
+                ));
                 self.set_list(items);
             }
             Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => self.report("검색을 완료하지 못했습니다."),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.report(crate::i18n::text("ui.could.not.complete.the.search"))
+            }
         }
         self.search = None;
         unsafe {
@@ -2484,38 +2566,55 @@ impl App {
             self.git.open = false;
         }
         let (label, button) = match mode {
-            Mode::Find => ("찾기", "↓"),
-            Mode::Replace => ("찾아 바꾸기", "↓"),
-            Mode::Workspace => ("폴더 검색", "검색"),
-            Mode::Quick => ("빠른 파일 열기", "열기"),
-            Mode::Goto => ("이동할 행", "이동"),
-            Mode::Font => ("글꼴 이름", "적용"),
-            Mode::Rename => ("심볼 이름", "변경"),
+            Mode::Find => (crate::i18n::text("ui.find"), "↓"),
+            Mode::Replace => (crate::i18n::text("ui.find.and.replace"), "↓"),
+            Mode::Workspace => (
+                crate::i18n::text("ui.search.folder"),
+                crate::i18n::text("ui.search"),
+            ),
+            Mode::Quick => (
+                crate::i18n::text("ui.quick.open"),
+                crate::i18n::text("ui.open"),
+            ),
+            Mode::Goto => (
+                crate::i18n::text("ui.line.to.go.to"),
+                crate::i18n::text("ui.go"),
+            ),
+            Mode::Rename => (
+                crate::i18n::text("ui.symbol.name"),
+                crate::i18n::text("ui.rename"),
+            ),
         };
         title(self.mode_label, label);
         title(self.action, button);
         title(
             self.second,
             if mode == Mode::Replace {
-                "바꾸기"
+                crate::i18n::text("ui.replace")
             } else {
                 "↑"
             },
         );
-        title(self.third, "모두");
-        title(self.dismiss, if mode.floats() { "×" } else { "닫기" });
+        title(self.third, crate::i18n::text("ui.all"));
+        title(
+            self.dismiss,
+            if mode.floats() {
+                "×"
+            } else {
+                crate::i18n::text("ui.close")
+            },
+        );
         edit_hint(
             self.query,
             match mode {
-                Mode::Find | Mode::Replace => "찾기",
-                Mode::Rename => "새 이름",
+                Mode::Find | Mode::Replace => crate::i18n::text("ui.find"),
+                Mode::Rename => crate::i18n::text("ui.new.name"),
                 _ => "",
             },
         );
-        edit_hint(self.replacement, "바꿀 내용");
+        edit_hint(self.replacement, crate::i18n::text("ui.replace.with"));
         let initial = match mode {
             Mode::Find | Mode::Replace | Mode::Workspace => self.last_find.clone(),
-            Mode::Font => self.settings.font.clone(),
             _ => String::new(),
         };
         title(self.query, &initial);
@@ -2596,9 +2695,9 @@ impl App {
                 text::wide_offset(&code, index),
                 text::wide_offset(&code, index + query.len()),
             );
-            self.report("검색 결과를 선택했습니다.");
+            self.report(crate::i18n::text("ui.selected.a.search.result"));
         } else {
-            self.report("일치하는 텍스트가 없습니다.");
+            self.report(crate::i18n::text("ui.no.matching.text.found"));
         }
     }
 
@@ -2607,7 +2706,7 @@ impl App {
             .active
             .is_some_and(|index| self.documents[index].is_preview())
         {
-            self.report("미리 보기 탭은 읽기 전용입니다.");
+            self.report(crate::i18n::text("ui.preview.tabs.are.read.only"));
             return;
         }
         let Some(editor) = self.editor() else {
@@ -2622,12 +2721,15 @@ impl App {
         if all {
             let count = code.matches(&query).count();
             if count == 0 {
-                self.report("일치하는 텍스트가 없습니다.");
+                self.report(crate::i18n::text("ui.no.matching.text.found"));
                 return;
             }
             select(editor, 0, -1);
             self.insert(editor, &code.replace(&query, &replacement));
-            self.report(&format!("{count}곳을 바꿨습니다."));
+            self.report(&crate::i18n::message(
+                "ui.replaced.matches",
+                &[(count).to_string()],
+            ));
         } else {
             let range = selection(editor);
             let start = text::byte_offset(&code, range.start);
@@ -2647,7 +2749,9 @@ impl App {
         let code = editor_text(handle);
         let language = self.documents[self.active.expect("active editor")].language;
         if code.len() > HIGHLIGHT_LIMIT {
-            self.report("큰 파일에서는 빠른 괄호 검사를 건너뜁니다.");
+            self.report(crate::i18n::text(
+                "ui.quick.bracket.checking.is.skipped.for.large",
+            ));
             return;
         }
         self.mode = None;
@@ -2656,14 +2760,20 @@ impl App {
         self.showing_issues = true;
         let items = text::brackets(&code, language)
             .into_iter()
-            .map(|(index, description)| ListItem::Issue {
+            .map(|(index, kind)| ListItem::Issue {
                 index,
                 line: code[..index].bytes().filter(|&b| b == b'\n').count(),
-                description,
+                kind,
             })
             .collect::<Vec<_>>();
-        self.report(&format!("괄호 검사 결과 {}개", items.len()));
-        title(self.sidebar_title, "문제 · 괄호 검사");
+        self.report(&crate::i18n::message(
+            "ui.bracket.issues",
+            &[(items.len()).to_string()],
+        ));
+        title(
+            self.sidebar_title,
+            crate::i18n::text("ui.problems.bracket.check"),
+        );
         self.set_list(items);
         self.layout();
     }
@@ -2724,7 +2834,7 @@ impl App {
         else {
             self.dismiss_completion();
             if manual {
-                self.report("자동완성 후보가 없습니다.");
+                self.report(crate::i18n::text("ui.no.completion.suggestions"));
             }
             return;
         };
@@ -2745,7 +2855,9 @@ impl App {
             return;
         };
         let Some(prefix) = self.documents[self.active.unwrap()].language.line_comment() else {
-            self.report("이 언어에는 줄 주석이 설정되어 있지 않습니다.");
+            self.report(crate::i18n::text(
+                "ui.line.comments.are.not.configured.for.this",
+            ));
             return;
         };
         let code = editor_text(editor);
@@ -2886,20 +2998,7 @@ impl App {
             {
                 self.dismiss_completion();
             }
-            (EDITOR, EN_VSCROLL) => {
-                for group in 0..2 {
-                    if self
-                        .group_document(group)
-                        .is_some_and(|i| self.documents[i].editor == sender)
-                    {
-                        repaint(if group == 0 {
-                            self.gutter
-                        } else {
-                            self.other_gutter
-                        });
-                    }
-                }
-            }
+            (EDITOR, EN_VSCROLL) => chrome::queue_scroll_sync(self.window, sender),
             (EDITOR, EN_SETFOCUS) => {
                 if let Some(index) = self.documents.iter().position(|doc| doc.editor == sender)
                     && self.active != Some(index)
@@ -2946,15 +3045,20 @@ impl App {
     fn perform(&mut self, id: usize) -> io::Result<()> {
         match id {
             data_view::FIRST_MODE..=data_view::LAST_MODE => self.change_data_mode(id)?,
+            data_view::OPEN_WEB_FIRST..=data_view::OPEN_WEB_LAST => {
+                self.open_markup_in_browser(id - data_view::OPEN_WEB_FIRST)?
+            }
             file_actions::COPY | file_actions::PASTE => {
                 self.file_clipboard(id, self.choose_clipboard_list())?;
             }
             browser::NEW_TAB => self.new_browser()?,
             dock::NEW_SECONDARY => {
                 let base = self.root.clone().map_or_else(std::env::current_dir, Ok)?;
-                if let Some(path) =
-                    folder_dialog(self.window, Some(&base), "보조 탐색기 폴더 열기")?
-                {
+                if let Some(path) = folder_dialog(
+                    self.window,
+                    Some(&base),
+                    crate::i18n::text("ui.open.a.folder.in.secondary.explorer"),
+                )? {
                     self.open_secondary_browser(path)?;
                 }
             }
@@ -2979,22 +3083,28 @@ impl App {
             | terminal::DOCK_BOTTOM
             | terminal::DOCK_LEFT
             | terminal::DOCK_RIGHT
+            | terminal::DOCK_SIDEBAR
+            | terminal::SIDEBAR_VIEW
             | terminal::CLOSE_TAB => self.terminal_command(id)?,
             NEW => self.new_document()?,
             WELCOME_NEW => self.new_browser()?,
             NEW_WINDOW => {
                 self.new_window_sender()?
                     .send(dock::Transfer::Empty)
-                    .map_err(|_| io::Error::other("새 창을 열 수 없습니다."))?;
+                    .map_err(|_| {
+                        io::Error::other(crate::i18n::text("ui.could.not.open.a.new.window"))
+                    })?;
             }
             OPEN | WELCOME_OPEN => {
                 let paths = file_dialog(self.window, false, OsStr::new(""))?;
                 self.open_paths(paths);
             }
             FOLDER | WELCOME_FOLDER => {
-                if let Some(path) =
-                    folder_dialog(self.window, self.root.as_deref(), "작업 폴더 열기")?
-                {
+                if let Some(path) = folder_dialog(
+                    self.window,
+                    self.root.as_deref(),
+                    crate::i18n::text("ui.open.workspace.folder"),
+                )? {
                     self.load_folder(path)?;
                 }
             }
@@ -3046,12 +3156,12 @@ impl App {
                 self.request_git_refresh();
             }
             PROBLEMS => self.show_problems(),
-            FONT => self.show_mode(Mode::Font),
+            FONT => self.open_font_preferences()?,
             SPLIT => self.toggle_split(),
             THEME | BIGGER | SMALLER | RESET_FONT | WRAP | INDENT_TWO | INDENT_FOUR
             | INDENT_TAB => {
                 match id {
-                    THEME => self.settings.dark = !self.settings.dark,
+                    THEME => self.settings.theme = Theme::from_dark(!self.settings.dark()),
                     BIGGER => self.settings.points = (self.settings.points + 1).min(36),
                     SMALLER => self.settings.points = (self.settings.points - 1).max(8),
                     RESET_FONT => self.settings.points = Settings::default().points,
@@ -3086,21 +3196,6 @@ impl App {
                     if let Ok(line) = caption(self.query).trim().parse::<usize>() {
                         self.clear_mode();
                         self.jump_line(line.saturating_sub(1), 0);
-                    }
-                }
-                Some(Mode::Font) => {
-                    let family = caption(self.query);
-                    let family = family.trim();
-                    if !family.is_empty()
-                        && family.encode_utf16().count() < 32
-                        && !family.chars().any(char::is_control)
-                    {
-                        self.settings.font = family.into();
-                        self.clear_mode();
-                        self.apply_preferences();
-                        self.settings.save()?;
-                    } else {
-                        self.report("31자 이내의 글꼴 이름을 입력하세요.");
                     }
                 }
                 Some(Mode::Rename) if self.explorer.edit.is_some() => {
@@ -3139,68 +3234,102 @@ impl App {
     fn show_toolbar_menu(&mut self, id: usize) {
         let items: &[(usize, &str)] = match id {
             FILE_MENU => &[
-                (browser::NEW_TAB, "새 탭\tCtrl+T"),
-                (NEW, "새 파일\tCtrl+N"),
-                (NEW_WINDOW, "새 창\tCtrl+Shift+N"),
-                (OPEN, "파일 열기\tCtrl+O"),
-                (FOLDER, "폴더 열기\tCtrl+K Ctrl+O"),
-                (QUICK, "빠른 파일 열기\tCtrl+P"),
-                (CLOSE_FOLDER, "폴더 닫기"),
+                (browser::NEW_TAB, crate::i18n::text("ui.new.tab_2")),
+                (NEW, crate::i18n::text("ui.new.file_2")),
+                (NEW_WINDOW, crate::i18n::text("ui.new.window")),
+                (OPEN, crate::i18n::text("ui.open.file_2")),
+                (FOLDER, crate::i18n::text("ui.open.folder")),
+                (QUICK, crate::i18n::text("ui.quick.open_2")),
+                (CLOSE_FOLDER, crate::i18n::text("ui.close.folder")),
                 (0, ""),
-                (SAVE, "저장\tCtrl+S"),
-                (SAVE_AS, "다른 이름으로 저장\tCtrl+Shift+S"),
-                (SAVE_ALL, "모두 저장"),
+                (SAVE, crate::i18n::text("ui.save")),
+                (SAVE_AS, crate::i18n::text("ui.save.as")),
+                (SAVE_ALL, crate::i18n::text("ui.save.all")),
                 (0, ""),
-                (CLOSE, "탭 닫기\tCtrl+F4"),
-                (REOPEN, "닫은 탭 다시 열기\tCtrl+Shift+T"),
+                (CLOSE, crate::i18n::text("ui.close.tab")),
+                (REOPEN, crate::i18n::text("ui.reopen.closed.tab")),
             ],
             EDIT_MENU => &[
-                (file_actions::COPY, "파일·폴더 복사\tCtrl+C"),
-                (file_actions::PASTE, "파일·폴더 붙여넣기\tCtrl+V"),
+                (
+                    file_actions::COPY,
+                    crate::i18n::text("ui.copy.files.and.folders"),
+                ),
+                (
+                    file_actions::PASTE,
+                    crate::i18n::text("ui.paste.files.and.folders"),
+                ),
                 (0, ""),
-                (FIND, "찾기\tCtrl+F"),
-                (REPLACE, "찾아 바꾸기\tCtrl+H"),
-                (WORKSPACE, "작업 폴더 검색\tCtrl+Shift+F"),
-                (GOTO, "줄로 이동\tCtrl+G"),
+                (FIND, crate::i18n::text("ui.find_2")),
+                (REPLACE, crate::i18n::text("ui.find.and.replace_2")),
+                (WORKSPACE, crate::i18n::text("ui.search.workspace_2")),
+                (GOTO, crate::i18n::text("ui.go.to.line")),
             ],
             TOOLS => &[
-                (dock::NEW_SECONDARY, "보조 탐색기 열기"),
-                (dock::CLOSE_SECONDARY, "보조 탐색기 닫기"),
-                (EXPLORER, "사이드바 표시 전환\tCtrl+B"),
-                (git::EXPLORER_VIEW, "파일 탐색기\tCtrl+Shift+E"),
-                (git::CHANGES_VIEW, "소스 제어\tCtrl+Shift+G"),
+                (
+                    dock::NEW_SECONDARY,
+                    crate::i18n::text("ui.open.secondary.explorer"),
+                ),
+                (
+                    dock::CLOSE_SECONDARY,
+                    crate::i18n::text("ui.close.secondary.explorer"),
+                ),
+                (EXPLORER, crate::i18n::text("ui.toggle.sidebar")),
+                (git::EXPLORER_VIEW, crate::i18n::text("ui.explorer_2")),
+                (git::CHANGES_VIEW, crate::i18n::text("ui.source.control_3")),
                 (
                     DOCK_SIDEBAR,
                     if self.settings.sidebar_right {
-                        "사이드바 왼쪽에 배치"
+                        crate::i18n::text("ui.move.sidebar.left")
                     } else {
-                        "사이드바 오른쪽에 배치"
+                        crate::i18n::text("ui.move.sidebar.right")
                     },
                 ),
-                (COLLAPSE_FOLDERS, "모든 폴더 접기"),
-                (REFRESH, "폴더 새로고침"),
+                (
+                    COLLAPSE_FOLDERS,
+                    crate::i18n::text("ui.collapse.all.folders"),
+                ),
+                (REFRESH, crate::i18n::text("ui.refresh.folder")),
                 (0, ""),
-                (PROBLEMS, "문제 · 괄호 검사\tCtrl+Shift+M"),
-                (FULLSCREEN, "전체 화면 전환\tF11"),
-                (SPLIT, "다른 탭과 화면 분할\tCtrl+\\"),
-                (terminal::TOGGLE, "터미널 표시 전환\tCtrl+\x60"),
+                (PROBLEMS, crate::i18n::text("ui.problems.bracket.check_2")),
+                (FULLSCREEN, crate::i18n::text("ui.toggle.full.screen")),
+                (SPLIT, crate::i18n::text("ui.split.editor.with.another.tab")),
+                (terminal::TOGGLE, crate::i18n::text("ui.toggle.terminal")),
             ],
             terminal::MENU => &[
-                (terminal::NEW, "새 PowerShell 탭\tCtrl+Shift+\x60"),
-                (terminal::NEW_CMD, "새 명령 프롬프트 탭"),
-                (terminal::CLOSE_TAB, "현재 터미널 탭 닫기"),
+                (terminal::NEW, crate::i18n::text("ui.new.powershell.tab")),
+                (
+                    terminal::NEW_CMD,
+                    crate::i18n::text("ui.new.command.prompt.tab"),
+                ),
+                (
+                    terminal::CLOSE_TAB,
+                    crate::i18n::text("ui.close.current.terminal.tab"),
+                ),
                 (
                     terminal::TOGGLE,
                     if self.terminal.visible {
-                        "터미널 숨기기\tCtrl+\x60"
+                        crate::i18n::text("ui.hide.terminal")
                     } else {
-                        "터미널 열기\tCtrl+\x60"
+                        crate::i18n::text("ui.show.terminal")
                     },
                 ),
                 (0, ""),
-                (terminal::DOCK_BOTTOM, "아래쪽에 배치"),
-                (terminal::DOCK_LEFT, "왼쪽에 배치"),
-                (terminal::DOCK_RIGHT, "오른쪽에 배치"),
+                (
+                    terminal::DOCK_BOTTOM,
+                    crate::i18n::text("ui.dock.at.bottom"),
+                ),
+                (
+                    terminal::DOCK_LEFT,
+                    crate::i18n::text("ui.dock.on.the.left"),
+                ),
+                (
+                    terminal::DOCK_RIGHT,
+                    crate::i18n::text("ui.dock.on.the.right"),
+                ),
+                (
+                    terminal::DOCK_SIDEBAR,
+                    crate::i18n::text("ui.open.in.sidebar"),
+                ),
             ],
             _ => &[],
         };
@@ -3551,7 +3680,11 @@ impl App {
             controls.push(self.dismiss);
         }
         if self.sidebar {
-            controls.extend([self.git.explorer, self.git.changes]);
+            controls.extend([
+                self.git.explorer,
+                self.git.changes,
+                self.terminal.sidebar_button,
+            ]);
             if self.git.open && self.git.has_repository() {
                 controls.extend(self.git.action_controls());
             }
@@ -3615,12 +3748,14 @@ impl App {
             .active
             .is_some_and(|index| self.documents[index].is_preview())
         {
-            return Err(io::Error::other("미리 보기 탭은 읽기 전용입니다."));
+            return Err(io::Error::other(crate::i18n::text(
+                "ui.preview.tabs.are.read.only",
+            )));
         }
         if editor_size(editor) > 1_000_000 {
-            return Err(io::Error::other(
-                "이 파일은 심볼 이름 바꾸기에 너무 큽니다.",
-            ));
+            return Err(io::Error::other(crate::i18n::text(
+                "ui.this.file.is.too.large.for.symbol",
+            )));
         }
         let language = self.documents[self.active.expect("active editor")].language;
         let source = editor_text(editor);
@@ -3648,7 +3783,7 @@ impl App {
             .iter()
             .find(|doc| doc.editor == editor)
             .map(|doc| doc.language)
-            .ok_or_else(|| io::Error::other("편집 탭이 닫혔습니다."))?;
+            .ok_or_else(|| io::Error::other(crate::i18n::text("ui.the.editor.tab.closed")))?;
         let source = editor_text(editor);
         let edit = rename.apply(&source, &name, language)?;
         let first = text::wide_offset(&source, edit.range.start);
@@ -3661,46 +3796,46 @@ impl App {
         send(editor, EM_SCROLLCARET, 0, 0);
         self.clear_mode();
         self.update_status();
-        self.report(&format!("심볼 이름을 {}곳에서 바꿨습니다.", edit.count));
+        self.report(&crate::i18n::message(
+            "ui.renamed.the.symbol.in.places",
+            &[(edit.count).to_string()],
+        ));
         Ok(())
     }
 
-    fn paint_gutter(&self, item: &DrawItem, paint: Paint) {
-        fill(item.dc, item.rect, paint.background);
-        let group = usize::from(item.id as usize == OTHER_GUTTER);
+    fn paint_gutter(&self, group: usize, dc: Handle, area: Rect, paint: Paint) {
         let Some(index) = self.group_document(group) else {
             return;
         };
         let editor = self.documents[index].editor;
         let first = send(editor, 0x00ce, 0, 0).max(0) as usize;
         let count = send(editor, 0x00ba, 0, 0).max(0) as usize;
-        let mut height = (self.settings.points * self.dpi / 72 + self.px(4)).max(12);
-        for line in first..count.min(first + 200) {
+        let line_y = |line| {
             let start = send(editor, 0x00bb, line, 0);
             if start < 0 {
-                break;
+                return None;
             }
             let mut point = Point::default();
             send(editor, 0x00d6, &mut point as *mut _ as usize, start);
-            let next = send(editor, 0x00bb, line + 1, 0);
-            if next >= 0 {
-                let mut next_point = Point::default();
-                send(editor, 0x00d6, &mut next_point as *mut _ as usize, next);
-                if next_point.y > point.y {
-                    height = next_point.y - point.y;
-                }
-            }
-            let top = item.rect.top + point.y;
-            if top >= item.rect.bottom {
+            Some(point.y)
+        };
+        let mut current = line_y(first);
+        let mut height = (self.settings.points * self.dpi / 72 + self.px(4)).max(12);
+        for line in first..count.min(first + 200) {
+            let Some(top) = current.filter(|&y| y < area.bottom) else {
                 break;
+            };
+            current = line_y(line + 1);
+            if let Some(next) = current.filter(|&next| next > top) {
+                height = next - top;
             }
             let rect = Rect {
                 top,
                 bottom: top + height,
-                ..item.rect
+                ..area
             };
             draw_label(
-                item.dc,
+                dc,
                 rect,
                 &(line + 1).to_string(),
                 paint.font,
@@ -3748,41 +3883,6 @@ fn caret_position(editor: Handle, wrapped: bool) -> (usize, usize) {
     (line as usize, (index as isize - start).max(0) as usize + 1)
 }
 
-fn highlight_color(color: Color, dark: bool) -> u32 {
-    match (color, dark) {
-        (Color::Keyword, true) => rgb(204, 178, 255),
-        (Color::Comment, true) => rgb(150, 172, 195),
-        (Color::String, true) => rgb(159, 221, 182),
-        (Color::Number, true) => rgb(246, 191, 133),
-        (Color::Markup, true) => rgb(143, 211, 246),
-        (Color::Function, true) => rgb(255, 218, 151),
-        (Color::Type, true) => rgb(122, 222, 200),
-        (Color::Property, true) => rgb(161, 207, 252),
-        (Color::Literal, true) => rgb(255, 173, 170),
-        (Color::Bracket(0), true) => rgb(240, 192, 103),
-        (Color::Bracket(1), true) => rgb(235, 153, 218),
-        (Color::Bracket(_), true) => rgb(111, 196, 255),
-        (Color::UnmatchedBracket, true) => rgb(255, 123, 118),
-        (Color::DiffAdded, true) => rgb(142, 222, 168),
-        (Color::DiffRemoved, true) => rgb(255, 148, 150),
-        (Color::Keyword, false) => rgb(103, 40, 164),
-        (Color::Comment, false) => rgb(83, 104, 127),
-        (Color::String, false) => rgb(22, 105, 60),
-        (Color::Number, false) => rgb(151, 76, 13),
-        (Color::Markup, false) => rgb(17, 88, 143),
-        (Color::Function, false) => rgb(118, 73, 2),
-        (Color::Type, false) => rgb(0, 107, 98),
-        (Color::Property, false) => rgb(19, 84, 137),
-        (Color::Literal, false) => rgb(153, 50, 66),
-        (Color::Bracket(0), false) => rgb(137, 94, 8),
-        (Color::Bracket(1), false) => rgb(145, 43, 121),
-        (Color::Bracket(_), false) => rgb(17, 93, 159),
-        (Color::UnmatchedBracket, false) => rgb(184, 38, 48),
-        (Color::DiffAdded, false) => rgb(22, 107, 65),
-        (Color::DiffRemoved, false) => rgb(156, 44, 52),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3815,21 +3915,24 @@ mod tests {
             selection_foreground(editor)
         };
         for dark in [true, false] {
-            app.settings.dark = dark;
+            app.settings.theme = Theme::from_dark(dark);
             app.apply_preferences();
             assert_eq!(
                 bracket_color("([\""),
-                highlight_color(Color::Bracket(1), dark)
+                PAINT.get().unwrap().highlight(Color::Bracket(1))
             );
             assert_eq!(
                 bracket_color("[\""),
-                highlight_color(Color::Bracket(2), dark)
+                PAINT.get().unwrap().highlight(Color::Bracket(2))
             );
             assert_eq!(
                 bracket_color("]);"),
-                highlight_color(Color::Bracket(2), dark)
+                PAINT.get().unwrap().highlight(Color::Bracket(2))
             );
-            assert_eq!(bracket_color("\"한"), highlight_color(Color::String, dark));
+            assert_eq!(
+                bracket_color("\"한"),
+                PAINT.get().unwrap().highlight(Color::String)
+            );
         }
 
         let offset = original.find("한글😀").expect("test word");
@@ -3874,7 +3977,7 @@ mod tests {
         select(editor, 0, 2);
         assert_eq!(
             selection_foreground(editor),
-            highlight_color(Color::Keyword, app.settings.dark)
+            PAINT.get().unwrap().highlight(Color::Keyword)
         );
 
         let symbol = text::wide_offset(&edited, edited.find("fn ").unwrap() + 1);
@@ -3901,7 +4004,7 @@ mod tests {
             editor_range(editor, 0, first_line_end * 2),
             large.lines().take(2).collect::<Vec<_>>().join("\n") + "\n"
         );
-        send(editor, 0x00b6, 0, 7_000); // EM_LINESCROLL
+        send(editor, EM_LINESCROLL, 0, 7_000);
         let line = send(editor, 0x00ce, 0, 0);
         assert!(line >= 6_000, "large viewport moved to line {line}");
         app.repaint_viewport();
@@ -3913,8 +4016,11 @@ mod tests {
         select(editor, start, start + 2);
         assert_eq!(
             selection_foreground(editor),
-            highlight_color(Color::Keyword, app.settings.dark)
+            PAINT.get().unwrap().highlight(Color::Keyword)
         );
+        send(editor, EM_LINESCROLL, 0, 1);
+        app.repaint_viewport();
+        assert_eq!(app.documents[app.active.unwrap()].colored_view, Some(range));
 
         unsafe {
             DestroyWindow(window);

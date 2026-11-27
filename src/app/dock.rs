@@ -19,6 +19,7 @@ pub(super) enum Destination {
     Top,
     Bottom,
     Sidebar,
+    TerminalSidebar,
     Window,
 }
 
@@ -38,6 +39,7 @@ pub(super) struct TransferredEditor {
     language: Language,
     dirty: bool,
     response: bool,
+    response_url: Option<String>,
     git_diff: Option<(PathBuf, bool)>,
     archive_member: Option<(PathBuf, PathBuf)>,
     selection: Selection,
@@ -98,6 +100,7 @@ pub(super) struct Dock {
     pub sidebar_splitter: Handle,
     pub sidebar_ratio: i32,
     pub sidebar_area: Rect,
+    pub terminal_sidebar: Rect,
     pub area: Rect,
     pub sidebar: Rect,
     pub stacked: bool,
@@ -148,6 +151,7 @@ impl Dock {
             sidebar_splitter: child(window, SIDEBAR_SPLITTER, chrome::SURFACE, "", 0)?,
             sidebar_ratio: 50,
             sidebar_area: Rect::default(),
+            terminal_sidebar: Rect::default(),
             area: Rect::default(),
             sidebar: Rect::default(),
             stacked: false,
@@ -304,8 +308,17 @@ impl App {
         if let Some(index) = self.documents.iter().position(|doc| doc.editor == editor) {
             if self.documents[index].revision == revision {
                 self.remove_document(index, false);
+                self.close_empty_after_move();
             } else {
-                self.report("탭을 옮기는 도중 편집한 내용을 원래 창에도 남겼습니다.");
+                self.report(crate::i18n::text("ui.edits.made.during.the.move.were.kept"));
+            }
+        }
+    }
+
+    pub(super) fn close_empty_after_move(&self) {
+        if self.documents.is_empty() && self.terminal.is_empty() {
+            unsafe {
+                PostMessageW(self.window, WM_CLOSE, 0, 0);
             }
         }
     }
@@ -322,7 +335,7 @@ impl App {
         let transfer = self.document_transfer(index)?;
         target
             .send(transfer, Some((self.window, editor)))
-            .map_err(|_| io::Error::other("대상 창에 탭을 옮길 수 없습니다."))?;
+            .map_err(|_| io::Error::other(crate::i18n::text("ui.could.not.move.the.tab.to.the")))?;
         self.dock
             .pending
             .insert(editor, self.documents[index].revision);
@@ -377,7 +390,9 @@ impl App {
         drop(worker);
         started
             .recv_timeout(std::time::Duration::from_secs(3))
-            .map_err(|_| io::Error::other("새 창을 초기화하지 못했습니다."))??;
+            .map_err(|_| {
+                io::Error::other(crate::i18n::text("ui.could.not.initialize.a.new.window"))
+            })??;
         Ok(payload)
     }
 
@@ -409,6 +424,7 @@ impl App {
                     language,
                     dirty,
                     response,
+                    response_url,
                     git_diff,
                     archive_member,
                     selection,
@@ -424,7 +440,7 @@ impl App {
                     return Ok(());
                 }
                 let label = if conflict.is_some() {
-                    format!("{label} (옮긴 초안)")
+                    crate::i18n::message("ui.moved.draft", std::slice::from_ref(&label))
                 } else {
                     label
                 };
@@ -439,6 +455,7 @@ impl App {
                 doc.language = language;
                 doc.dirty = dirty;
                 doc.response = response;
+                doc.response_url = response_url;
                 doc.git_diff = git_diff;
                 doc.archive_member = archive_member;
                 send(doc.editor, EM_SETREADONLY, usize::from(doc.is_preview()), 0);
@@ -469,7 +486,9 @@ impl App {
             .as_ref()
             .is_some_and(browser::Browser::loading)
         {
-            return Err(io::Error::other("GET 요청이 완료된 뒤 탭을 옮겨 주세요."));
+            return Err(io::Error::other(crate::i18n::text(
+                "ui.wait.for.the.get.request.to.finish",
+            )));
         }
         let payload = if let Some(view) = &document.browser {
             Transfer::Browser(
@@ -486,6 +505,7 @@ impl App {
                 language: document.language,
                 dirty: send(document.editor, EM_GETMODIFY, 0, 0) != 0,
                 response: document.response,
+                response_url: document.response_url.clone(),
                 git_diff: document.git_diff.clone(),
                 archive_member: document.archive_member.clone(),
                 selection: selection(document.editor),
@@ -506,8 +526,9 @@ impl App {
         let payload = self.document_transfer(index)?;
         self.new_window_sender()?
             .send(payload)
-            .map_err(|_| io::Error::other("새 창이 닫혔습니다."))?;
+            .map_err(|_| io::Error::other(crate::i18n::text("ui.the.new.window.closed")))?;
         self.remove_document(index, false);
+        self.close_empty_after_move();
         Ok(())
     }
 
@@ -580,7 +601,9 @@ impl App {
             return;
         }
         self.dock.preview = Some(target);
-        let area = if target == Destination::Sidebar {
+        let area = if target == Destination::TerminalSidebar {
+            self.dock.terminal_sidebar
+        } else if target == Destination::Sidebar {
             self.dock.sidebar
         } else {
             self.dock.area
@@ -598,12 +621,14 @@ impl App {
                 Rect::from_size(area.right - width / 4 - gap, y, width / 4, height - gap * 2)
             }
             Destination::Top => Rect::from_size(x, y, width - gap * 2, height / 4),
-            Destination::Bottom | Destination::Sidebar => Rect::from_size(
-                x,
-                area.bottom - height / 3 - gap,
-                width - gap * 2,
-                height / 3,
-            ),
+            Destination::Bottom | Destination::Sidebar | Destination::TerminalSidebar => {
+                Rect::from_size(
+                    x,
+                    area.bottom - height / 3 - gap,
+                    width - gap * 2,
+                    height / 3,
+                )
+            }
             Destination::Window => {
                 let button = width.min(self.px(200));
                 Rect::from_size(
@@ -614,6 +639,16 @@ impl App {
                 )
             }
         };
+        if target == Destination::TerminalSidebar {
+            self.report(i18n::text("terminal.sidebar_hint"));
+            motion::animate(
+                self.window,
+                motion::Key::control(self.dock.guide, motion::Effect::Reveal),
+                motion::Area::Control,
+                false,
+                true,
+            );
+        }
         show_overlay(self.dock.guide, zone);
         repaint(self.dock.guide);
     }
@@ -642,7 +677,16 @@ impl App {
             };
             fill(dc, edge, palette.border);
         } else if let Some(target) = self.dock.preview {
-            fill(dc, area, palette.accent_brush);
+            let border = if target == Destination::TerminalSidebar {
+                let reveal = motion::value(
+                    motion::Key::control(self.dock.guide, motion::Effect::Reveal),
+                    true,
+                );
+                motion::mix(palette.border_rgb, palette.accent, reveal)
+            } else {
+                palette.accent
+            };
+            fill_color(dc, area, border);
             fill(
                 dc,
                 Rect {
@@ -654,12 +698,13 @@ impl App {
                 palette.control,
             );
             let label = match target {
-                Destination::Window => "새 창으로 열기",
-                Destination::Sidebar => "보조 탐색기에 열기",
-                Destination::Left => "왼쪽에 열기",
-                Destination::Right => "오른쪽에 열기",
-                Destination::Top => "위에 열기",
-                Destination::Bottom => "아래에 열기",
+                Destination::Window => crate::i18n::text("ui.open.in.new.window"),
+                Destination::Sidebar => crate::i18n::text("ui.open.in.secondary.explorer"),
+                Destination::TerminalSidebar => crate::i18n::text("ui.open.terminal.in.sidebar"),
+                Destination::Left => crate::i18n::text("ui.open.on.the.left"),
+                Destination::Right => crate::i18n::text("ui.open.on.the.right"),
+                Destination::Top => crate::i18n::text("ui.open.above"),
+                Destination::Bottom => crate::i18n::text("ui.open.below"),
             };
             draw_label(dc, area, label, palette.font, palette.foreground, true);
         }
@@ -801,9 +846,11 @@ impl App {
                 }
                 if moved && outside {
                     let result = if let Some(window) = self.transfer_target(control, point) {
-                        window
-                            .send(Transfer::Path(drag.path), None)
-                            .map_err(|_| io::Error::other("대상 창에 열 수 없습니다."))
+                        window.send(Transfer::Path(drag.path), None).map_err(|_| {
+                            io::Error::other(crate::i18n::text(
+                                "ui.could.not.open.in.the.target.window",
+                            ))
+                        })
                     } else {
                         self.drop_path(drag.path, target)
                     };
@@ -831,7 +878,7 @@ impl App {
             Destination::Window => self
                 .new_window_sender()?
                 .send(Transfer::Path(path))
-                .map_err(|_| io::Error::other("새 창이 닫혔습니다.")),
+                .map_err(|_| io::Error::other(crate::i18n::text("ui.the.new.window.closed"))),
             side => {
                 let previous = self.active;
                 self.browse_path(&path)?;

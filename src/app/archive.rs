@@ -115,11 +115,15 @@ impl Reader {
     fn open(path: &Path) -> io::Result<Self> {
         static API: OnceLock<Option<Api>> = OnceLock::new();
         let api = API.get_or_init(Api::load).as_ref().ok_or_else(|| {
-            io::Error::other("이 Windows에는 압축 파일을 읽는 시스템 구성 요소가 없습니다.")
+            io::Error::other(crate::i18n::text(
+                "ui.this.windows.installation.lacks.the.archive.component",
+            ))
         })?;
         let raw = unsafe { (api.new)() };
         if raw.is_null() {
-            return Err(io::Error::other("압축 파일을 열 수 없습니다."));
+            return Err(io::Error::other(crate::i18n::text(
+                "ui.could.not.open.the.archive",
+            )));
         }
         let reader = Self { api, raw };
         let name: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
@@ -152,7 +156,9 @@ impl Reader {
                 let name = unsafe { (self.api.name)(raw).as_ref() }
                     .and_then(|ptr| unsafe { CStr::from_ptr(ptr) }.to_str().ok())
                     .ok_or_else(|| {
-                        io::Error::other("압축 파일에서 항목 이름을 읽을 수 없습니다.")
+                        io::Error::other(crate::i18n::text(
+                            "ui.could.not.read.an.archive.entry.name",
+                        ))
                     })?;
                 let kind = unsafe { (self.api.kind)(raw) };
                 let regular = kind == 0o100000 && unsafe { (self.api.hardlink)(raw).is_null() };
@@ -177,9 +183,11 @@ impl Reader {
             if count < 0 {
                 return Err(self.error());
             }
-            *budget = budget
-                .checked_sub(count as u64)
-                .ok_or_else(|| io::Error::other("압축을 푼 데이터가 크기 제한을 넘었습니다."))?;
+            *budget = budget.checked_sub(count as u64).ok_or_else(|| {
+                io::Error::other(crate::i18n::text(
+                    "ui.the.extracted.data.exceeded.the.size.limit",
+                ))
+            })?;
             output.write_all(&buffer[..count as usize])?;
         }
     }
@@ -188,8 +196,10 @@ impl Reader {
         let error = unsafe { (self.api.error)(self.raw).as_ref() };
         let detail = error.map(|ptr| unsafe { CStr::from_ptr(ptr) }.to_string_lossy());
         io::Error::other(match detail {
-            Some(detail) => format!("압축 파일을 처리할 수 없습니다. {detail}"),
-            None => "압축 파일을 처리할 수 없습니다.".to_owned(),
+            Some(detail) => {
+                crate::i18n::message("ui.could.not.process.the.archive", &[(detail).to_string()])
+            }
+            None => crate::i18n::text("ui.could.not.process.the.archive_2").to_owned(),
         })
     }
 }
@@ -202,7 +212,9 @@ struct Entry {
 
 fn member_path(name: &str) -> io::Result<PathBuf> {
     if name.starts_with(['/', '\\']) {
-        return Err(io::Error::other("압축 파일에 절대 경로가 들어 있습니다."));
+        return Err(io::Error::other(crate::i18n::text(
+            "ui.the.archive.contains.an.absolute.path",
+        )));
     }
     let mut path = PathBuf::new();
     for component in name
@@ -211,7 +223,9 @@ fn member_path(name: &str) -> io::Result<PathBuf> {
     {
         explorer::validate_component(component)?;
         if path.components().count() >= 64 {
-            return Err(io::Error::other("압축 파일의 폴더 경로가 너무 깊습니다."));
+            return Err(io::Error::other(crate::i18n::text(
+                "ui.the.archive.folder.path.is.too.deep",
+            )));
         }
         path.push(component);
     }

@@ -1,3 +1,4 @@
+mod markup;
 mod model;
 
 use super::*;
@@ -10,6 +11,8 @@ pub(super) const PRETTY_EDITOR: usize = 403;
 pub(super) const EXPAND_ALL: usize = 404;
 pub(super) const COLLAPSE_ALL: usize = 405;
 const NOTICE: usize = 406;
+pub(super) const OPEN_WEB_FIRST: usize = 407;
+pub(super) const OPEN_WEB_LAST: usize = 408;
 pub(super) const READY: u32 = 0x8027;
 pub(super) const TOGGLE: u32 = 0x8028;
 
@@ -28,17 +31,24 @@ pub(super) enum ViewMode {
 const MODES: [ViewMode; 3] = [ViewMode::Raw, ViewMode::Pretty, ViewMode::Tree];
 
 pub(super) fn supports(language: Language, path: Option<&Path>) -> bool {
-    language == Language::Yaml
+    matches!(language, Language::Yaml | Language::Html | Language::Xml)
         || language == Language::Json
             && !path
                 .and_then(Path::extension)
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonc"))
 }
 
-pub(super) fn pane_buttons(parent: Handle) -> io::Result<[[Handle; 3]; 2]> {
-    let mut groups = [[0; 3]; 2];
+pub(super) fn pane_buttons(parent: Handle) -> io::Result<[[Handle; 4]; 2]> {
+    let mut groups = [[0; 4]; 2];
     for (group, buttons) in groups.iter_mut().enumerate() {
-        for (index, text) in ["원문", "Pretty Print", "트리"].into_iter().enumerate() {
+        for (index, text) in [
+            crate::i18n::text("ui.source"),
+            i18n::text("data.pretty"),
+            crate::i18n::text("ui.tree"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let handle = child(
                 parent,
                 FIRST_MODE + group * 3 + index,
@@ -49,6 +59,16 @@ pub(super) fn pane_buttons(parent: Handle) -> io::Result<[[Handle; 3]; 2]> {
             chrome::watch_control(handle, true);
             buttons[index] = handle;
         }
+    }
+    for (group, buttons) in groups.iter_mut().enumerate() {
+        buttons[3] = child(
+            parent,
+            OPEN_WEB_FIRST + group,
+            "BUTTON",
+            crate::i18n::text("ui.open.in.browser"),
+            BS_OWNERDRAW | WS_TABSTOP,
+        )?;
+        chrome::watch_control(buttons[3], true);
     }
     Ok(groups)
 }
@@ -99,19 +119,20 @@ impl View {
                     | ES_AUTOHSCROLL
                     | ES_AUTOVSCROLL,
             )?;
+            chrome::watch_control(pretty, false);
             send(pretty, EM_EXLIMITTEXT, 0, 32 * 1024 * 1024);
             send(pretty, EM_SETREADONLY, 1, 0);
             let notice = create(NOTICE, "STATIC", "", SS_NOPREFIX | SS_CENTERIMAGE)?;
             let expand = create(
                 EXPAND_ALL,
                 "BUTTON",
-                "모두 펼치기",
+                crate::i18n::text("ui.expand.all"),
                 BS_OWNERDRAW | WS_TABSTOP,
             )?;
             let collapse = create(
                 COLLAPSE_ALL,
                 "BUTTON",
-                "모두 접기",
+                crate::i18n::text("ui.collapse.all"),
                 BS_OWNERDRAW | WS_TABSTOP,
             )?;
             for button in [expand, collapse] {
@@ -163,6 +184,13 @@ impl View {
         for handle in [self.list, self.notice].into_iter().chain(self.all) {
             set_font(handle, palette.font);
             repaint(handle);
+        }
+        for (button, key) in self
+            .all
+            .into_iter()
+            .zip(["ui.expand.all", "ui.collapse.all"])
+        {
+            title(button, i18n::text(key));
         }
         send(
             self.pretty,
@@ -249,7 +277,7 @@ impl View {
         if editor_size(editor) > model::MAX_INPUT {
             title(
                 self.notice,
-                "8 MiB 이하의 JSON·YAML에서 구조 보기를 사용할 수 있습니다.",
+                crate::i18n::text("ui.structured.views.are.available.for.documents.up"),
             );
             return Ok(());
         }
@@ -266,7 +294,10 @@ impl View {
                 }
             })?;
         self.pending = Some(rx);
-        title(self.notice, "문서 구조를 읽는 중…");
+        title(
+            self.notice,
+            crate::i18n::text("ui.reading.document.structure"),
+        );
         Ok(())
     }
 
@@ -297,7 +328,7 @@ impl View {
             } else {
                 title(
                     self.notice,
-                    "정돈된 텍스트가 너무 깁니다. 트리에서 구조를 확인할 수 있습니다.",
+                    crate::i18n::text("ui.the.formatted.text.is.too.large.use"),
                 );
             }
         }
@@ -362,7 +393,7 @@ impl View {
         }
     }
 
-    fn paint_row(&self, item: &DrawItem, palette: Paint, dark: bool, px: impl Fn(i32) -> i32) {
+    fn paint_row(&self, item: &DrawItem, palette: Paint, px: impl Fn(i32) -> i32) {
         let active = item.state & 1 != 0;
         let color = if active {
             palette.selected_rgb
@@ -429,7 +460,7 @@ impl View {
             },
             &node.value,
             palette.font,
-            highlight_color(node.color, dark),
+            palette.highlight(node.color),
             false,
         );
     }
@@ -454,11 +485,18 @@ impl App {
             let doc = &self.documents[index];
             doc.browser.is_none() && supports(doc.language, doc.path.as_deref())
         });
+        let web = active
+            && self.group_document(group).is_some_and(|index| {
+                let doc = &self.documents[index];
+                doc.language == Language::Html && (doc.path.is_some() || doc.response_url.is_some())
+            });
+        let count = if web { 4 } else { 3 };
         let mut x = area.right - self.px(5);
-        for (index, width) in [48, 88, 45].into_iter().enumerate().rev() {
+        for (index, width) in [48, 88, 45, 130].into_iter().enumerate().rev() {
             let button = self.data_buttons[group][index];
-            if visible && active {
-                let width = self.px(width).min(area.width() / 3);
+            let show_button = visible && active && (index != 3 || web);
+            if show_button {
+                let width = self.px(width).min(area.width() / count);
                 x -= width;
                 place(
                     button,
@@ -468,9 +506,30 @@ impl App {
                     area.height() - 2,
                 );
             }
-            show(button, visible && active);
+            show(button, show_button);
         }
         if active { x - area.left } else { area.width() }
+    }
+
+    pub(super) fn open_markup_in_browser(&self, group: usize) -> io::Result<()> {
+        let Some(doc) = self
+            .group_document(group)
+            .map(|index| &self.documents[index])
+        else {
+            return Ok(());
+        };
+        if doc.language == Language::Html {
+            if let Some(url) = doc
+                .response_url
+                .as_deref()
+                .filter(|url| browser::is_url(url))
+            {
+                shell_open(self.window, OsStr::new(url))?;
+            } else if let Some(path) = doc.path.as_deref().filter(|path| path.is_file()) {
+                open_html_file(self.window, path)?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn data_mode_selected(&self, id: usize) -> bool {
@@ -526,9 +585,9 @@ impl App {
             return;
         };
         if let Err(error) = result {
-            let message = format!(
-                "구조를 읽을 수 없습니다. {}",
-                error.to_string().replace('\n', " ")
+            let message = crate::i18n::message(
+                "ui.could.not.read.the.structure",
+                &[(error.to_string().replace('\n', " ")).to_string()],
             );
             title(view.notice, &message);
             self.report(&message);
@@ -616,7 +675,7 @@ impl App {
             .filter_map(|doc| doc.data_view.as_ref())
             .find(|view| view.list == item.window)
         {
-            view.paint_row(item, palette, self.settings.dark, |n| self.px(n));
+            view.paint_row(item, palette, |n| self.px(n));
         } else {
             fill(item.dc, item.rect, palette.background);
         }

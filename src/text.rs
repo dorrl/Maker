@@ -1,3 +1,4 @@
+use crate::{i18n, theme::Theme};
 pub(crate) mod completion;
 pub(crate) mod symbols;
 
@@ -27,7 +28,7 @@ pub fn decode(bytes: &[u8]) -> io::Result<(String, Encoding)> {
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "UTF-8 텍스트 파일만 열 수 있습니다.",
+                crate::i18n::text("ui.maker.opens.utf.8.text.files"),
             )
         })?;
     Ok((
@@ -80,7 +81,8 @@ pub(crate) fn write_atomically(
 
 #[derive(Clone)]
 pub struct Settings {
-    pub dark: bool,
+    pub theme: Theme,
+    pub locale: i18n::Locale,
     pub font: String,
     pub points: i32,
     pub wrap: bool,
@@ -97,6 +99,7 @@ pub enum TerminalDock {
     Bottom,
     Left,
     Right,
+    Sidebar,
 }
 
 impl TerminalDock {
@@ -105,6 +108,7 @@ impl TerminalDock {
             Self::Bottom => "bottom",
             Self::Left => "left",
             Self::Right => "right",
+            Self::Sidebar => "sidebar",
         }
     }
 }
@@ -112,7 +116,8 @@ impl TerminalDock {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            dark: true,
+            theme: Theme::default(),
+            locale: i18n::Locale::default(),
             font: "Cascadia Code".into(),
             points: 11,
             wrap: false,
@@ -140,15 +145,20 @@ impl Settings {
         let Some(contents) = Self::path().and_then(|path| fs::read_to_string(path).ok()) else {
             return settings;
         };
+        let mut theme = None;
+        let mut legacy_dark = true;
         for (key, value) in contents.lines().filter_map(|line| line.split_once('=')) {
             match key {
-                "dark" => settings.dark = value != "false",
+                "locale" => settings.locale = i18n::Locale::read(value),
+                "dark" => legacy_dark = value != "false",
+                "theme" => theme = Theme::from_name(value),
                 "wrap" => settings.wrap = value == "true",
                 "sidebar_right" => settings.sidebar_right = value == "true",
                 "terminal_dock" => {
                     settings.terminal_dock = match value {
                         "left" => TerminalDock::Left,
                         "right" => TerminalDock::Right,
+                        "sidebar" => TerminalDock::Sidebar,
                         _ => TerminalDock::Bottom,
                     };
                 }
@@ -180,17 +190,26 @@ impl Settings {
                 _ => {}
             }
         }
+        settings.theme = theme.unwrap_or_else(|| Theme::from_dark(legacy_dark));
         settings
     }
 
+    pub fn dark(&self) -> bool {
+        self.theme.dark()
+    }
+
     pub fn save(&self) -> io::Result<()> {
-        let path = Self::path().ok_or_else(|| io::Error::other("설정 경로를 찾을 수 없습니다."))?;
+        let path = Self::path().ok_or_else(|| {
+            io::Error::other(crate::i18n::text("ui.could.not.find.the.settings.path"))
+        })?;
         fs::create_dir_all(path.parent().expect("settings has a parent directory"))?;
         write_atomically(&path, |file| {
             write!(
                 file,
-                "dark={}\nwrap={}\nfont={}\npoints={}\nspaces={}\nsidebar_width={}\nsidebar_right={}\nterminal_dock={}\nterminal_height={}\nterminal_width={}\n",
-                self.dark,
+                "locale={}\ntheme={}\ndark={}\nwrap={}\nfont={}\npoints={}\nspaces={}\nsidebar_width={}\nsidebar_right={}\nterminal_dock={}\nterminal_height={}\nterminal_width={}\n",
+                self.locale.code(),
+                self.theme.name(),
+                self.dark(),
                 self.wrap,
                 self.font,
                 self.points,
@@ -319,8 +338,8 @@ impl Language {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Plain => "일반 텍스트",
-            Self::Diff => "Git 변경",
+            Self::Plain => crate::i18n::text("ui.plain.text"),
+            Self::Diff => crate::i18n::text("ui.git.changes"),
             Self::Rust => "Rust",
             Self::JavaScript => "JavaScript",
             Self::TypeScript => "TypeScript",
@@ -1060,13 +1079,19 @@ pub fn highlighting(text: &str, lang: Language) -> Vec<Token> {
     highlights
 }
 
-pub fn brackets(text: &str, lang: Language) -> Vec<(usize, &'static str)> {
+pub fn brackets(text: &str, lang: Language) -> Vec<(usize, BracketIssue)> {
     let (_, mut issues) = bracket_tokens(text, lang, &tokens(text, lang));
     issues.truncate(160);
     issues
 }
 
-type BracketIssues = Vec<(usize, &'static str)>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BracketIssue {
+    Unclosed,
+    UnmatchedClosing,
+}
+
+type BracketIssues = Vec<(usize, BracketIssue)>;
 
 fn bracket_tokens(text: &str, lang: Language, syntax: &[Token]) -> (Vec<Token>, BracketIssues) {
     if matches!(
@@ -1105,7 +1130,7 @@ fn bracket_tokens(text: &str, lang: Language, syntax: &[Token]) -> (Vec<Token>, 
             let mut other = opens.pop().expect("opening bracket exists");
             while other.1 != kind {
                 open_counts[other.1] -= 1;
-                issues.push((styles[other.0].start, "닫히지 않은 괄호"));
+                issues.push((styles[other.0].start, BracketIssue::Unclosed));
                 other = opens.pop().expect("matching opening bracket exists");
             }
             open_counts[kind] -= 1;
@@ -1118,7 +1143,7 @@ fn bracket_tokens(text: &str, lang: Language, syntax: &[Token]) -> (Vec<Token>, 
             });
             continue;
         } else {
-            issues.push((index, "짝이 맞지 않는 닫는 괄호"));
+            issues.push((index, BracketIssue::UnmatchedClosing));
         }
         styles.push(Token {
             start: index,
@@ -1129,7 +1154,7 @@ fn bracket_tokens(text: &str, lang: Language, syntax: &[Token]) -> (Vec<Token>, 
     issues.extend(
         opens
             .into_iter()
-            .map(|(position, _, _)| (styles[position].start, "닫히지 않은 괄호")),
+            .map(|(position, _, _)| (styles[position].start, BracketIssue::Unclosed)),
     );
     issues.sort_unstable_by_key(|&(index, _)| index);
     (styles, issues)
@@ -1158,7 +1183,11 @@ mod tests {
         );
         assert_eq!(
             brackets(code, Language::Rust),
-            vec![(code.len() - 1, "짝이 맞지 않는 닫는 괄호")]
+            vec![(code.len() - 1, BracketIssue::UnmatchedClosing)]
+        );
+        assert_eq!(
+            brackets("([)", Language::Rust),
+            vec![(1, BracketIssue::Unclosed)]
         );
     }
 

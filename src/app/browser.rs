@@ -12,7 +12,12 @@ pub(super) const SELECT: u32 = 0x8020;
 pub(super) const HTTP_READY: u32 = 0x8021;
 pub(super) const SEARCH_READY: u32 = 0x8022;
 pub(super) const TIMER: usize = 11;
-type Response = (String, u16);
+struct Response {
+    body: String,
+    status: u16,
+    language: Language,
+    url: String,
+}
 
 pub(super) const FIELD_FRAME: usize = 388;
 pub(super) const HERO: usize = 389;
@@ -65,9 +70,9 @@ impl Browser {
             let mut actions = [0; 3];
             if !folder {
                 for (index, (id, label)) in [
-                    (WORK_FOLDER, "작업 폴더"),
-                    (OPEN_FILE, "파일 열기"),
-                    (RECENT_FILE, "최근 닫은 파일"),
+                    (WORK_FOLDER, crate::i18n::text("ui.workspace")),
+                    (OPEN_FILE, crate::i18n::text("ui.open.file")),
+                    (RECENT_FILE, crate::i18n::text("ui.recently.closed")),
                 ]
                 .into_iter()
                 .enumerate()
@@ -77,6 +82,7 @@ impl Browser {
                 }
             }
             let query = make(QUERY_ID, "EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL)?;
+            chrome::watch_control(query, false);
             let list = make(
                 RESULTS,
                 "LISTBOX",
@@ -140,10 +146,22 @@ impl Browser {
                 (24 * palette.dpi / 96) as isize,
             );
         }
+        for (button, key) in
+            self.actions
+                .into_iter()
+                .zip(["ui.workspace", "ui.open.file", "ui.recently.closed"])
+        {
+            if button != 0 {
+                title(button, i18n::text(key));
+            }
+        }
         let hint = if self.folder {
-            format!("{}에서 찾기 · 경로 또는 URL", file_name(&self.base))
+            crate::i18n::message(
+                "ui.search.in.path.or.url",
+                &[(file_name(&self.base)).to_string()],
+            )
         } else {
-            "파일·폴더 이름, 경로 또는 URL 검색".to_owned()
+            crate::i18n::text("ui.search.for.a.file.folder.path.or").to_owned()
         };
         edit_hint(self.query, &hint);
     }
@@ -342,7 +360,7 @@ fn children(folder: &Path) -> Vec<(PathBuf, bool)> {
     entries
 }
 
-fn is_url(text: &str) -> bool {
+pub(super) fn is_url(text: &str) -> bool {
     text.get(..7)
         .is_some_and(|start| start.eq_ignore_ascii_case("http://"))
         || text
@@ -361,9 +379,9 @@ fn target_path(base: &Path, text: &str) -> io::Result<PathBuf> {
             Some(std::path::Component::Prefix(_))
         )
     {
-        return Err(io::Error::other(
-            "드라이브 문자를 포함한 전체 경로를 입력하세요.",
-        ));
+        return Err(io::Error::other(crate::i18n::text(
+            "ui.enter.the.full.path.including.the.drive",
+        )));
     }
     Ok(base.join(path))
 }
@@ -471,7 +489,7 @@ impl App {
         let label = if folder {
             file_name(browser.base()).into_owned()
         } else {
-            "새 탭".to_owned()
+            crate::i18n::text("ui.new.tab").to_owned()
         };
         self.add_document(None, label, "", Encoding::default())?;
         let index = self.active.expect("new browser document");
@@ -537,12 +555,13 @@ impl App {
                     bottom: rect.top + self.px(37),
                     ..rect
                 },
-                "파일, 폴더 및 URL 열기",
+                crate::i18n::text("ui.open.a.file.folder.or.url"),
                 palette.large_font,
                 palette.foreground,
                 true,
             );
-            let base = format!("검색 위치   {}", view.base.display());
+            let base =
+                crate::i18n::message("ui.search.location", &[(view.base.display()).to_string()]);
             draw_label(
                 item.dc,
                 Rect {
@@ -612,6 +631,15 @@ impl App {
         }
     }
 
+    pub(super) fn browser_results_at(&self, query: Handle, screen: Point) -> Option<Handle> {
+        self.browser_for(query)
+            .filter(|view| view.query == query && unsafe { IsWindowVisible(view.list) } != 0)
+            .filter(|view| {
+                relative_rect(view.list, 0).has(screen) || relative_rect(query, 0).has(screen)
+            })
+            .map(|view| view.list)
+    }
+
     pub(super) fn browser_action(&mut self, id: usize, sender: Handle) -> io::Result<()> {
         let Some(index) = self.documents.iter().position(|doc| {
             doc.browser
@@ -635,7 +663,7 @@ impl App {
             OPEN_FILE => self.perform(OPEN),
             _ => {
                 if self.recently_closed.is_empty() {
-                    self.report("최근에 닫은 파일이 없습니다.");
+                    self.report(crate::i18n::text("ui.there.are.no.recently.closed.files"));
                 } else {
                     self.perform(REOPEN)?;
                 }
@@ -990,16 +1018,18 @@ impl App {
         };
         let (url, _) = view.request.take().unwrap();
         match result {
-            Ok((body, status)) => {
+            Ok(Response {
+                body,
+                status,
+                language,
+                url: effective_url,
+            }) => {
                 let doc = &mut self.documents[index];
                 doc.label = url.chars().take(100).collect();
                 doc.browser = None;
                 doc.response = true;
-                doc.language = if body.trim_start().starts_with(['{', '[']) {
-                    Language::Json
-                } else {
-                    Language::Plain
-                };
+                doc.language = language;
+                doc.response_url = Some(effective_url);
                 set_editor_text(doc.editor, &body);
                 send(doc.editor, EM_SETREADONLY, 1, 0);
                 send(doc.editor, EM_SETMODIFY, 0, 0);
@@ -1009,7 +1039,7 @@ impl App {
                     self.focus_editor();
                     self.update_status();
                 }
-                self.report(&format!("HTTP {status}"));
+                self.report(&i18n::message("http.status", &[status.to_string()]));
             }
             Err(error) => self.report(&error.to_string()),
         }
@@ -1037,7 +1067,7 @@ fn get(url: &str) -> io::Result<Response> {
             "--max-filesize",
             "4194304",
             "--write-out",
-            "\n%{http_code}",
+            "\n%{http_code}\n%{content_type}\n%{url_effective}",
             "--url",
             url,
         ])
@@ -1046,14 +1076,15 @@ fn get(url: &str) -> io::Result<Response> {
         .stderr(Stdio::null())
         .creation_flags(0x08000000)
         .spawn()?;
+    const MAX_METADATA: u64 = 256 * 1024;
     let mut bytes = Vec::new();
     let result = process
         .stdout
         .take()
         .expect("curl stdout")
-        .take(MAX_RESPONSE + 5)
+        .take(MAX_RESPONSE + MAX_METADATA + 1)
         .read_to_end(&mut bytes);
-    if result.is_err() || bytes.len() as u64 > MAX_RESPONSE + 4 {
+    if result.is_err() || bytes.len() as u64 > MAX_RESPONSE + MAX_METADATA {
         let _ = process.kill();
     }
     let status = process.wait()?;
@@ -1064,15 +1095,65 @@ fn get(url: &str) -> io::Result<Response> {
             status.code().unwrap_or(-1)
         )));
     }
-    let end = bytes
-        .iter()
-        .rposition(|&byte| byte == b'\n')
-        .ok_or_else(|| io::Error::other("HTTP 상태 줄이 없습니다."))?;
-    let code = std::str::from_utf8(&bytes[end + 1..])
+    let mut fields = bytes.rsplitn(4, |&byte| byte == b'\n');
+    let invalid = || io::Error::other("HTTP 응답 형식이 올바르지 않습니다.");
+    let effective_url =
+        std::str::from_utf8(fields.next().ok_or_else(invalid)?).map_err(io::Error::other)?;
+    let media =
+        std::str::from_utf8(fields.next().ok_or_else(invalid)?).map_err(io::Error::other)?;
+    let status = std::str::from_utf8(fields.next().ok_or_else(invalid)?)
         .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| io::Error::other("HTTP 상태를 읽을 수 없습니다."))?;
-    let (text, _) = text::decode(&bytes[..end])
-        .map_err(|_| io::Error::other("응답을 UTF-8 텍스트로 열 수 없습니다."))?;
-    Ok((text, code))
+        .and_then(|status| status.parse().ok())
+        .ok_or_else(invalid)?;
+    let body = fields.next().ok_or_else(invalid)?;
+    if body.len() as u64 > MAX_RESPONSE {
+        return Err(io::Error::other("HTTP 응답이 4 MiB를 초과했습니다."));
+    }
+    let (body, _) = text::decode(body)
+        .map_err(|_| io::Error::other("본문을 UTF-8 텍스트로 읽을 수 없습니다."))?;
+    let language = response_language(media, &body);
+    Ok(Response {
+        body,
+        status,
+        language,
+        url: if is_url(effective_url) {
+            effective_url.to_owned()
+        } else {
+            url.to_owned()
+        },
+    })
+}
+
+fn response_language(content_type: &str, body: &str) -> Language {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match mime.as_str() {
+        "text/html" | "application/xhtml+xml" => Language::Html,
+        "image/svg+xml" | "application/xml" | "text/xml" => Language::Xml,
+        "application/yaml" | "application/x-yaml" | "text/yaml" | "text/x-yaml" => Language::Yaml,
+        "application/json" => Language::Json,
+        _ if mime.ends_with("+json") => Language::Json,
+        _ => {
+            let start: String = body
+                .trim_start()
+                .chars()
+                .take(24)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if ["<!doctype html", "<html", "<head", "<body"]
+                .iter()
+                .any(|prefix| start.starts_with(prefix))
+            {
+                Language::Html
+            } else if start.starts_with(['{', '[']) {
+                Language::Json
+            } else {
+                Language::Plain
+            }
+        }
+    }
 }

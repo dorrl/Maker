@@ -72,11 +72,15 @@ impl App {
             }
             let count = paths.len();
             if copy_to_clipboard(self.window, paths) {
-                self.report(&format!(
-                    "Maker에 {count}개 항목을 복사했습니다. Windows 클립보드에 접근할 수 없습니다."
+                self.report(&crate::i18n::message(
+                    "ui.copied.items.within.maker.the.windows.clipboard",
+                    &[(count).to_string()],
                 ));
             } else {
-                self.report(&format!("{count}개 항목을 복사했습니다."));
+                self.report(&crate::i18n::message(
+                    "ui.copied.items",
+                    &[(count).to_string()],
+                ));
             }
             return Ok(());
         }
@@ -92,23 +96,27 @@ impl App {
             })
             .or_else(|| self.browser_list_base(control).map(Path::to_owned))
             .or_else(|| self.root.clone())
-            .ok_or_else(|| io::Error::other("붙여넣을 폴더를 먼저 여세요."))?;
+            .ok_or_else(|| {
+                io::Error::other(crate::i18n::text("ui.open.the.destination.folder.first"))
+            })?;
         let paths = files_from_clipboard(self.window)?;
         if paths.is_empty() {
-            self.report("클립보드에 파일이나 폴더가 없습니다.");
+            self.report(crate::i18n::text(
+                "ui.the.clipboard.contains.no.files.or.folders",
+            ));
             return Ok(());
         }
         let target = directory.canonicalize()?;
         for source in &paths {
             if !source.is_absolute() {
-                return Err(io::Error::other(
-                    "클립보드의 파일 경로가 올바르지 않습니다.",
-                ));
+                return Err(io::Error::other(crate::i18n::text(
+                    "ui.a.file.path.on.the.clipboard.is",
+                )));
             }
             if source.is_dir() && target.starts_with(source.canonicalize()?) {
-                return Err(io::Error::other(
-                    "폴더를 자기 자신이나 하위 폴더에 복사할 수 없습니다.",
-                ));
+                return Err(io::Error::other(crate::i18n::text(
+                    "ui.a.folder.cannot.be.copied.into.itself",
+                )));
             }
         }
         let complete = copy_paths(self.window, &paths, &directory);
@@ -119,7 +127,10 @@ impl App {
         self.reload_open_folders();
         self.request_git_refresh();
         if complete? {
-            self.report(&format!("{}개 항목을 붙여넣었습니다.", paths.len()));
+            self.report(&crate::i18n::message(
+                "ui.pasted.items",
+                &[(paths.len()).to_string()],
+            ));
         }
         Ok(())
     }

@@ -4,6 +4,7 @@ use motion::{Area, Effect, Key};
 pub(super) const SURFACE: &str = "MakerSurface";
 pub(super) const DIVIDER: usize = 310;
 pub(super) const POPUP: usize = 311;
+pub(super) const SIDEBAR_RESIZE_TIMER: usize = 12;
 const FIRST_SCROLL: usize = 320;
 const LAST_SCROLL: usize = 325;
 const SCROLL_SYNC: u32 = 0x8001;
@@ -15,6 +16,8 @@ thread_local! {
     static PRESSED_BUTTON: Cell<Handle> = const { Cell::new(0) };
     static MODIFIED_LIST_CLICK: Cell<bool> = const { Cell::new(false) };
     static HOVERED_ROW: Cell<Option<(Handle, usize)>> = const { Cell::new(None) };
+    static SCROLL_DIRTY: RefCell<Vec<Handle>> = const { RefCell::new(Vec::new()) };
+    static WHEEL_REMAINDER: Cell<(Handle, i32)> = const { Cell::new((0, 0)) };
 }
 
 pub(super) fn row_is_hovered(window: Handle, row: usize) -> bool {
@@ -98,6 +101,7 @@ pub(super) fn animate_folder(list: Handle, row: usize, open: bool) {
 pub(super) struct ScrollBar {
     handle: Handle,
     target: Handle,
+    info: Option<ScrollInfo>,
     horizontal: bool,
     explorer: bool,
     visible: bool,
@@ -141,6 +145,7 @@ pub(super) struct Chrome {
     divider_hover: bool,
     scroll_hover: Option<usize>,
     drag: Option<Drag>,
+    pending_sidebar_x: Option<i32>,
     pub(super) menu: Option<Menu>,
     closing_menu: Option<Menu>,
     closing_editor_tools: bool,
@@ -173,6 +178,7 @@ impl Chrome {
             divider_hover: false,
             scroll_hover: None,
             drag: None,
+            pending_sidebar_x: None,
             menu: None,
             closing_menu: None,
             closing_editor_tools: false,
@@ -213,14 +219,7 @@ extern "system" fn surface_proc(window: Handle, message: u32, wp: usize, lp: isi
     let id = unsafe { GetDlgCtrlID(window) } as usize;
     match message {
         WM_PAINT => {
-            if matches!(
-                id,
-                POPUP | TABS | SECOND_TABS | BREADCRUMB | SECOND_BREADCRUMB
-            ) {
-                buffered_paint(window, |dc, rect| draw_surface(id, dc, rect));
-            } else {
-                paint(window, |dc, rect| draw_surface(id, dc, rect));
-            }
+            buffered_paint(window, |dc, rect| draw_surface(id, dc, rect));
             return 0;
         }
         WM_PRINTCLIENT => {
@@ -272,6 +271,114 @@ pub(super) fn watch_control(window: Handle, toolbar: bool) {
     subclass(window, control_proc, usize::from(toolbar));
 }
 
+fn wheel_steps(delta: i32, lines: u32, remainder: i32) -> (i32, i32) {
+    const WHEEL_DELTA: i64 = 120;
+    let scale = if lines == u32::MAX { 1 } else { lines };
+    let amount = i64::from(remainder) + i64::from(delta) * i64::from(scale);
+    let steps = (amount / WHEEL_DELTA).clamp(i64::from(-i32::MAX), i64::from(i32::MAX));
+    (steps as i32, (amount % WHEEL_DELTA) as i32)
+}
+
+fn wheel_movement(window: Handle, wp: usize) -> (i32, bool) {
+    let lines = wheel_scroll_lines();
+    if lines == 0 {
+        return (0, false);
+    }
+    let (previous, remainder) = WHEEL_REMAINDER.get();
+    let (steps, remainder) = wheel_steps(
+        (wp >> 16) as i16 as i32,
+        lines,
+        if previous == window { remainder } else { 0 },
+    );
+    WHEEL_REMAINDER.set((window, remainder));
+    (steps, lines == u32::MAX)
+}
+
+fn scroll_editor_wheel(window: Handle, wp: usize) {
+    let (steps, page) = wheel_movement(window, wp);
+    if steps == 0 {
+        return;
+    }
+    if page {
+        let command = if steps > 0 { 2 } else { 3 }; // SB_PAGEUP / SB_PAGEDOWN
+        for _ in 0..steps.unsigned_abs() {
+            send(window, EM_SCROLL, command, 0);
+        }
+    } else {
+        send(window, EM_LINESCROLL, 0, -steps as isize);
+    }
+}
+
+fn scroll_list_wheel(window: Handle, parent: Handle, wp: usize) {
+    let (steps, page) = wheel_movement(window, wp);
+    if steps == 0 {
+        return;
+    }
+    let top = send(window, LB_GETTOPINDEX, 0, 0) as i32;
+    let count = send(window, LB_GETCOUNT, 0, 0) as i32;
+    if top < 0 || count <= 0 {
+        return;
+    }
+    let distance = if page {
+        let height = send(window, LB_GETITEMHEIGHT, 0, 0).max(1) as i32;
+        steps.saturating_mul((bounds(window).height() / height).max(1))
+    } else {
+        steps
+    };
+    let next = top.saturating_sub(distance).clamp(0, count - 1);
+    if next != top {
+        reset_file_motion(window);
+        send(window, LB_SETTOPINDEX, next as usize, 0);
+        queue_scroll_sync(parent, window);
+    }
+}
+
+fn paint_button_control(window: Handle, parent: Handle, id: usize, dc: Handle, rect: Rect) {
+    let button_state = send(window, BM_GETSTATE, 0, 0);
+    let item = DrawItem {
+        kind: 4, // ODT_BUTTON
+        id: id as u32,
+        item: 0,
+        action: 1, // ODA_DRAWENTIRE
+        state: u32::from(button_state & 4 != 0) | (u32::from(button_state & 8 != 0) << 4),
+        window,
+        dc,
+        rect,
+        data: 0,
+    };
+    send(parent, WM_DRAWITEM, id, &item as *const _ as isize);
+}
+
+fn sidebar_button(id: usize) -> bool {
+    matches!(
+        id,
+        git::EXPLORER_VIEW
+            | git::CHANGES_VIEW
+            | terminal::SIDEBAR_VIEW
+            | explorer::NEW_FILE
+            | explorer::NEW_FOLDER
+            | git::COMMIT
+            | git::STAGE
+            | git::UNSTAGE
+            | git::REFRESH
+            | git::GRAPH_BRANCH
+            | git::GRAPH_COMPARE
+    )
+}
+
+pub(super) fn queue_scroll_sync(parent: Handle, window: Handle) {
+    let first = SCROLL_DIRTY.with_borrow_mut(|pending| {
+        let first = pending.is_empty();
+        if !pending.contains(&window) {
+            pending.push(window);
+        }
+        first
+    });
+    if first && unsafe { PostMessageW(parent, SCROLL_SYNC, 0, 0) } == 0 {
+        SCROLL_DIRTY.with_borrow_mut(Vec::clear);
+    }
+}
+
 extern "system" fn control_proc(
     window: Handle,
     message: u32,
@@ -281,19 +388,51 @@ extern "system" fn control_proc(
     toolbar: usize,
 ) -> isize {
     let parent = unsafe { GetParent(window) };
+    let id = unsafe { GetDlgCtrlID(window) } as usize;
     if toolbar != 0 {
+        if sidebar_button(id) && PAINT.get().is_some() {
+            match message {
+                WM_ERASEBKGND => return 1,
+                WM_PAINT => {
+                    buffered_paint(window, |dc, rect| {
+                        paint_button_control(window, parent, id, dc, rect)
+                    });
+                    return 0;
+                }
+                WM_PRINTCLIENT => {
+                    paint_button_control(window, parent, id, wp as Handle, bounds(window));
+                    return 0;
+                }
+                _ => {}
+            }
+        }
         button_input(parent, window, message, wp);
         if matches!(message, WM_MOUSEMOVE | WM_MOUSELEAVE) && wp & 1 == 0 {
             return 0;
         }
     }
-    let list = toolbar == 0 && unsafe { GetDlgCtrlID(window) } == LIST as i32;
-    let browser_list = toolbar == 0 && unsafe { GetDlgCtrlID(window) } == browser::RESULTS as i32;
-    let data_list = toolbar == 0 && unsafe { GetDlgCtrlID(window) } == data_view::TREE as i32;
-    let row_list = list
-        || browser_list
-        || data_list
-        || toolbar == 0 && unsafe { GetDlgCtrlID(window) } == git::GRAPH_LIST as i32;
+    if matches!(id, EDITOR | data_view::PRETTY_EDITOR) && message == WM_MOUSEWHEEL && wp & 0x0c == 0
+    {
+        scroll_editor_wheel(window, wp);
+        return 0;
+    }
+    let list = id == LIST;
+    let browser_list = id == browser::RESULTS;
+    let data_list = id == data_view::TREE;
+    let row_list = list || browser_list || data_list || id == git::GRAPH_LIST;
+    if message == WM_MOUSEWHEEL && wp & 0x0c == 0 {
+        if row_list {
+            scroll_list_wheel(window, parent, wp);
+            return 0;
+        }
+        if id == browser::QUERY_ID
+            && let Some(list) =
+                with_app(|app| app.browser_results_at(window, Point::packed(lp))).flatten()
+        {
+            scroll_list_wheel(list, parent, wp);
+            return 0;
+        }
+    }
     if row_list && message == WM_MOUSEMOVE {
         if HOVERED_ROW.get().is_none_or(|(list, _)| list != window) {
             watch_mouse(window);
@@ -361,16 +500,12 @@ extern "system" fn control_proc(
     if list && message == WM_LBUTTONUP && MODIFIED_LIST_CLICK.replace(false) {
         return 0;
     }
-    let deletes = toolbar == 0
+    let deletes = id == EDITOR
         && matches!(
             (message, wp),
             (WM_KEYDOWN, 8 | 0x2e) | (0x0102, 8 | 0x7f) | (0x0300 | 0x0303, _)
-        )
-        && unsafe { GetDlgCtrlID(window) } == EDITOR as i32;
-    if matches!(message, 0x0302 | 0x0440)
-        && toolbar == 0
-        && unsafe { GetDlgCtrlID(window) } == EDITOR as i32
-    {
+        );
+    if id == EDITOR && matches!(message, 0x0302 | 0x0440) {
         with_app(|app| app.invalidate_editor_styles(window));
     }
     let previous_delete = if deletes {
@@ -398,7 +533,7 @@ extern "system" fn control_proc(
     {
         post_explorer_click(parent, window, item, Point::packed(lp));
     }
-    if toolbar == 0
+    if (id == EDITOR || list || id == git::GRAPH_LIST)
         && matches!(
             message,
             WM_MOUSEWHEEL
@@ -406,15 +541,14 @@ extern "system" fn control_proc(
                 | WM_VSCROLL
                 | WM_KEYDOWN
                 | WM_LBUTTONUP
-                | WM_SIZE
                 | 0x0102
+                | EM_SCROLL
+                | EM_LINESCROLL
                 | EM_SETSCROLLPOS
                 | EM_SCROLLCARET
         )
     {
-        unsafe {
-            PostMessageW(parent, SCROLL_SYNC, window as usize, 0);
-        }
+        queue_scroll_sync(parent, window);
     }
     result
 }
@@ -433,8 +567,11 @@ pub(super) fn post_explorer_click(parent: Handle, window: Handle, row: usize, po
 pub(super) fn handle_parent_message(message: u32, wp: usize, modifiers: isize) -> bool {
     match message {
         SCROLL_SYNC => {
+            let dirty = SCROLL_DIRTY.with_borrow_mut(std::mem::take);
             with_app(|app| {
-                app.redraw_scroll_position(wp as Handle);
+                for target in dirty {
+                    app.redraw_scroll_position(target);
+                }
             });
         }
         EXPLORER_CLICK => {
@@ -583,6 +720,11 @@ impl Thumb {
     }
 }
 
+pub(super) fn vertical_thumb(target: Handle, height: i32, minimum: i32) -> Option<(i32, i32)> {
+    let thumb = Thumb::measure(scrollbar(target, false)?, height, minimum)?;
+    Some((thumb.start, thumb.length))
+}
+
 impl App {
     pub(super) fn sync_scrollbars(&mut self) {
         let second = self.other.and_then(|index| {
@@ -591,7 +733,7 @@ impl App {
         });
         let active = self.editor();
         let targets = [
-            self.sidebar.then_some(self.list),
+            (self.sidebar && !self.terminal_in_sidebar()).then_some(self.list),
             active,
             active,
             second,
@@ -601,6 +743,7 @@ impl App {
         for (index, target) in targets.into_iter().enumerate() {
             let bar = &mut self.chrome.bars[index];
             let was_visible = bar.visible;
+            let previous = bar.target;
             bar.visible = false;
             bar.target = target.unwrap_or(0);
             if let Some(target) = target {
@@ -641,10 +784,15 @@ impl App {
                     Rect::from_size(right, origin.y, outer.right - right, bottom - origin.y)
                 };
                 if rect.width() > 2 && rect.height() > 2 {
-                    if !was_visible || relative_rect(bar.handle, self.window) != rect {
+                    let moved = !was_visible || relative_rect(bar.handle, self.window) != rect;
+                    if moved {
                         show_overlay(bar.handle, rect);
                     }
-                    repaint(bar.handle);
+                    let info = scrollbar(target, bar.horizontal);
+                    if moved || previous != bar.target || bar.info != info {
+                        repaint(bar.handle);
+                    }
+                    bar.info = info;
                     bar.visible = true;
                 }
             }
@@ -655,13 +803,23 @@ impl App {
     }
 
     pub(super) fn redraw_scroll_position(&mut self, target: Handle) {
-        for bar in &self.chrome.bars {
+        for bar in &mut self.chrome.bars {
             if bar.visible && bar.target == target {
-                repaint(bar.handle);
+                let info = scrollbar(target, bar.horizontal);
+                if bar.info != info {
+                    bar.info = info;
+                    repaint(bar.handle);
+                }
             }
         }
-        if self.editor() == Some(target) {
-            repaint(self.gutter);
+        for (group, gutter) in [self.gutter, self.other_gutter].into_iter().enumerate() {
+            if self.group_document(group).is_some_and(|index| {
+                let doc = &self.documents[index];
+                doc.editor == target && doc.source_visible()
+            }) && !self.settings.wrap
+            {
+                repaint(gutter);
+            }
         }
         self.schedule_viewport_highlight(target);
     }
@@ -718,7 +876,7 @@ impl App {
         if bar.explorer {
             reset_file_motion(bar.target);
         }
-        self.redraw_scroll_position(bar.target);
+        queue_scroll_sync(self.window, bar.target);
     }
 
     fn paint_surface(&self, id: usize, dc: Handle, rect: Rect, palette: Paint) {
@@ -728,6 +886,9 @@ impl App {
             }
             BREADCRUMB | SECOND_BREADCRUMB => {
                 self.paint_breadcrumb(usize::from(id == SECOND_BREADCRUMB), dc, rect, palette)
+            }
+            GUTTER | OTHER_GUTTER => {
+                self.paint_gutter(usize::from(id == OTHER_GUTTER), dc, rect, palette)
             }
             dock::GUIDE | dock::SPLITTER | dock::SIDEBAR_SPLITTER => {
                 self.paint_dock(id, dc, rect, palette)
@@ -886,40 +1047,20 @@ impl App {
             }
             WM_MOUSEMOVE => {
                 self.chrome.divider_hover = true;
-                if let Some(Drag::Sidebar {
-                    x: start,
-                    width: original,
-                    right,
-                }) = self.chrome.drag
+                if matches!(self.chrome.drag, Some(Drag::Sidebar { .. }))
+                    && self.chrome.pending_sidebar_x.replace(x).is_none()
+                    && unsafe { SetTimer(self.window, SIDEBAR_RESIZE_TIMER, 16, 0) } == 0
                 {
-                    let cross = if right {
-                        x < width / 4
-                    } else {
-                        x > width * 3 / 4
-                    };
-                    if self.settings.sidebar_right != right || cross {
-                        let stays_crossed = if right {
-                            x < width / 3
-                        } else {
-                            x > width * 2 / 3
-                        };
-                        self.settings.sidebar_right = if stays_crossed { !right } else { right };
-                    }
-                    let desired = if self.settings.sidebar_right != right {
-                        original
-                    } else if right {
-                        original + start - x
-                    } else {
-                        original + x - start
-                    };
-                    self.settings.sidebar_width =
-                        (self.clamp_sidebar(desired, width) * 96 / self.dpi).max(144);
-                    self.layout();
+                    self.flush_sidebar_resize();
                 }
             }
             WM_MOUSELEAVE => self.chrome.divider_hover = false,
             WM_LBUTTONUP | WM_CAPTURECHANGED => {
                 if matches!(self.chrome.drag, Some(Drag::Sidebar { .. })) {
+                    if message == WM_LBUTTONUP {
+                        self.chrome.pending_sidebar_x = Some(x);
+                    }
+                    self.flush_sidebar_resize();
                     self.chrome.drag = None;
                     if message == WM_LBUTTONUP {
                         unsafe {
@@ -948,9 +1089,69 @@ impl App {
         }
     }
 
+    pub(super) fn flush_sidebar_resize(&mut self) {
+        let Some(x) = self.chrome.pending_sidebar_x.take() else {
+            return;
+        };
+        unsafe { KillTimer(self.window, SIDEBAR_RESIZE_TIMER) };
+        let Some(Drag::Sidebar {
+            x: start,
+            width: original,
+            right,
+        }) = self.chrome.drag
+        else {
+            return;
+        };
+        let width = bounds(self.window).width();
+        let was_right = self.settings.sidebar_right;
+        let previous_width = self.sidebar_size(width);
+        let crossed = if right {
+            x < width / if was_right { 4 } else { 3 }
+        } else if was_right {
+            x > width * 2 / 3
+        } else {
+            x > width * 3 / 4
+        };
+        self.settings.sidebar_right = right ^ crossed;
+        let desired = if crossed {
+            original
+        } else {
+            original + if right { start - x } else { x - start }
+        };
+        let desired = (self.clamp_sidebar(desired, width) * 96 / self.dpi).max(144);
+        if was_right == self.settings.sidebar_right && desired == self.settings.sidebar_width {
+            return;
+        }
+        self.settings.sidebar_width = desired;
+        self.layout_geometry();
+        let after = self.sidebar_size(width);
+        let rect = bounds(self.window);
+        if was_right != self.settings.sidebar_right {
+            repaint(self.window);
+        } else {
+            let (old_edge, edge) = if was_right {
+                (width - previous_width, width - after)
+            } else {
+                (previous_width, after)
+            };
+            repaint_rect(
+                self.window,
+                Rect {
+                    left: old_edge.min(edge),
+                    right: old_edge.max(edge),
+                    top: self.px(34),
+                    bottom: rect.bottom - self.px(26),
+                },
+            );
+        }
+    }
+
     pub(super) fn save_sidebar_settings(&self) {
         if let Err(error) = self.settings.save() {
-            self.report(&format!("설정을 저장할 수 없습니다. {error}"));
+            self.report(&crate::i18n::message(
+                "ui.could.not.save.settings",
+                &[(error).to_string()],
+            ));
         }
     }
 
@@ -2338,5 +2539,16 @@ mod tests {
         assert_eq!(thumb.start, 140);
         assert_eq!(thumb.position(0), 0);
         assert_eq!(thumb.position(280), 99200);
+    }
+
+    #[test]
+    fn wheel_uses_system_distance_and_retains_fractional_input() {
+        assert_eq!(wheel_steps(-120, 3, 0), (-3, 0));
+        assert_eq!(wheel_steps(-40, 3, 0), (-1, 0));
+        assert_eq!(wheel_steps(-20, 3, 0), (0, -60));
+        assert_eq!(wheel_steps(-20, 3, -60), (-1, 0));
+        assert_eq!(wheel_steps(20, 3, -60), (0, 0));
+        assert_eq!(wheel_steps(-120, u32::MAX, 0), (-1, 0));
+        assert_eq!(wheel_steps(-40, u32::MAX, 0), (0, -40));
     }
 }
