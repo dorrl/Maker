@@ -69,7 +69,10 @@ pub(in crate::app) struct Graph {
     pub list: Handle,
     pub branch: Handle,
     pub compare: Handle,
+    pub remote: [Handle; 3],
     header: Handle,
+    tooltip: Handle,
+    tooltip_labels: RefCell<[Vec<u16>; 3]>,
     query: Query,
     history: History,
     work: Option<Work>,
@@ -100,24 +103,36 @@ impl Graph {
                 | WS_TABSTOP,
         )?;
         chrome::watch_control(list, false);
-        Ok(Self {
+        let branch = button(GRAPH_BRANCH, i18n::text("ui.commits.head"))?;
+        let compare = button(GRAPH_COMPARE, i18n::text("ui.compare.auto"))?;
+        let header = child(
+            window,
+            HEADER,
+            "STATIC",
+            i18n::text("ui.commit.graph"),
+            SS_CENTERIMAGE | SS_NOPREFIX | 0x4000, // SS_ENDELLIPSIS
+        )?;
+        let mut remote = [0; 3];
+        for (handle, (id, action)) in remote.iter_mut().zip(RemoteAction::BUTTONS) {
+            *handle = button(id, action.label())?;
+        }
+        let graph = Self {
             list,
-            branch: button(GRAPH_BRANCH, crate::i18n::text("ui.commits.head"))?,
-            compare: button(GRAPH_COMPARE, crate::i18n::text("ui.compare.auto"))?,
-            header: child(
-                window,
-                HEADER,
-                "STATIC",
-                crate::i18n::text("ui.commit.graph"),
-                SS_CENTERIMAGE | SS_NOPREFIX,
-            )?,
+            branch,
+            compare,
+            remote,
+            header,
+            tooltip: tooltip_window(window),
+            tooltip_labels: RefCell::new(Default::default()),
             query: Query::default(),
             history: History::default(),
             work: None,
             refresh: Instant::now(),
             notice: None,
             picker: None,
-        })
+        };
+        graph.refresh_remote_labels();
+        Ok(graph)
     }
 
     pub(super) fn reset(&mut self) {
@@ -139,13 +154,33 @@ impl Graph {
             set_font(window, paint.font);
         }
         send(self.list, LB_SETITEMHEIGHT, 0, row_height as isize);
+        tooltip_colors(self.tooltip, paint.menu_rgb, paint.foreground);
     }
 
     pub(super) fn refresh_locale(&self) {
         title(self.header, i18n::text("ui.commit.graph"));
+        self.refresh_remote_labels();
         self.refresh_ref_labels();
         if self.history.rows.is_empty() {
             self.populate_rows();
+        }
+    }
+
+    fn refresh_remote_labels(&self) {
+        let mut labels = self.tooltip_labels.borrow_mut();
+        for ((handle, (_, action)), label) in self
+            .remote
+            .into_iter()
+            .zip(RemoteAction::BUTTONS)
+            .zip(labels.iter_mut())
+        {
+            let name = action.label();
+            title(handle, name);
+            let next: Vec<_> = name.encode_utf16().chain([0]).collect();
+            if *label != next {
+                tooltip_label(self.tooltip, handle, &next, !label.is_empty());
+                *label = next;
+            }
         }
     }
 
@@ -229,14 +264,26 @@ impl App {
         let top = area.bottom - height;
         let pad = self.px(6);
         let row = self.px(25);
+        let tool_width = self.px(22);
+        let tools_left = area.right - pad - 3 * tool_width;
         let button_width = (area.width() - 3 * pad).max(0) / 2;
         place(
             graph.header,
             area.left + pad,
             top + self.px(2),
-            area.width() - 2 * pad,
+            tools_left - area.left - pad,
             row,
         );
+        for (index, button) in graph.remote.into_iter().enumerate() {
+            place(
+                button,
+                tools_left + index as i32 * tool_width,
+                top + self.px(2),
+                tool_width,
+                row,
+            );
+            show(button, visible);
+        }
         place(graph.branch, area.left + pad, top + row, button_width, row);
         place(
             graph.compare,

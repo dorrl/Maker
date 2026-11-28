@@ -117,11 +117,13 @@ impl View {
                     | ES_MULTILINE
                     | ES_NOHIDESEL
                     | ES_AUTOHSCROLL
-                    | ES_AUTOVSCROLL,
+                    | ES_AUTOVSCROLL
+                    | ES_DISABLENOSCROLL,
             )?;
             chrome::watch_control(pretty, false);
             send(pretty, EM_EXLIMITTEXT, 0, 32 * 1024 * 1024);
             send(pretty, EM_SETREADONLY, 1, 0);
+            send(pretty, EM_SETEVENTMASK, 0, ENM_SCROLL);
             let notice = create(NOTICE, "STATIC", "", SS_NOPREFIX | SS_CENTERIMAGE)?;
             let expand = create(
                 EXPAND_ALL,
@@ -200,50 +202,54 @@ impl View {
         );
         send(self.pretty, EM_SETTARGETDEVICE, 0, 1);
         let font = Some((settings.font.as_str(), settings.points));
-        char_format(self.pretty, 4, palette.foreground, font);
-        char_format(self.pretty, 0, palette.foreground, font);
+        char_format(self.pretty, 4, palette.foreground, None, font);
+        char_format(self.pretty, 0, palette.foreground, None, font);
         repaint(self.pretty);
     }
 
     pub fn layout(&self, area: Option<Rect>, dpi: i32) {
         let active = area.is_some() && self.mode != ViewMode::Raw;
         let tree = active && self.mode == ViewMode::Tree && self.data.is_some();
-        let pretty = active && self.mode == ViewMode::Pretty && self.preview_ready;
+        let pretty = active && self.pretty_editor().is_some();
         let message = active && !tree && !pretty;
         if let Some(area) = area.filter(|_| active) {
             let px = |n: i32| n * dpi / 96;
-            let toolbar = px(34).min(area.height());
-            let width = px(92).min((area.width() - px(18)).max(0) / 2);
-            for (index, button) in self.all.into_iter().enumerate() {
+            if tree {
+                let toolbar = px(34).min(area.height());
+                let width = px(92).min((area.width() - px(18)).max(0) / 2);
+                for (index, button) in self.all.into_iter().enumerate() {
+                    place(
+                        button,
+                        area.left + px(6) + index as i32 * (width + px(6)),
+                        area.top + px(4),
+                        width,
+                        toolbar - px(8),
+                    );
+                }
                 place(
-                    button,
-                    area.left + px(6) + index as i32 * (width + px(6)),
-                    area.top + px(4),
-                    width,
-                    toolbar - px(8),
+                    self.list,
+                    area.left,
+                    area.top + toolbar,
+                    area.width(),
+                    area.height() - toolbar,
+                );
+            } else if pretty {
+                place(
+                    self.pretty,
+                    area.left + px(8),
+                    area.top + px(5),
+                    area.width() - px(8),
+                    area.height() - px(5),
+                );
+            } else {
+                place(
+                    self.notice,
+                    area.left + px(12),
+                    area.top + px(3),
+                    area.width() - px(18),
+                    px(34).min(area.height()),
                 );
             }
-            place(
-                self.list,
-                area.left,
-                area.top + toolbar,
-                area.width(),
-                area.height() - toolbar,
-            );
-            place(
-                self.pretty,
-                area.left + px(8),
-                area.top + px(5),
-                area.width() - px(8),
-                area.height() - px(5),
-            );
-            place(
-                self.notice,
-                area.left + px(12),
-                area.top + px(3),
-                area.width() - px(18),
-                toolbar,
-            );
         }
         show(self.list, tree);
         show(self.pretty, pretty);
@@ -256,10 +262,14 @@ impl View {
     pub fn focus(&self) -> Option<Handle> {
         match self.mode {
             ViewMode::Raw => None,
-            ViewMode::Pretty if self.preview_ready => Some(self.pretty),
+            ViewMode::Pretty => self.pretty_editor(),
             ViewMode::Tree if self.data.is_some() => Some(self.list),
             _ => None,
         }
+    }
+
+    pub fn pretty_editor(&self) -> Option<Handle> {
+        (self.mode == ViewMode::Pretty && self.preview_ready).then_some(self.pretty)
     }
 
     fn owns(&self, handle: Handle) -> bool {
@@ -491,20 +501,16 @@ impl App {
                 doc.language == Language::Html && (doc.path.is_some() || doc.response_url.is_some())
             });
         let count = if web { 4 } else { 3 };
-        let mut x = area.right - self.px(5);
+        let margin = self.px(5).min(area.width());
+        let max_width = (area.width() - margin) / count;
+        let mut x = area.right - margin;
         for (index, width) in [48, 88, 45, 130].into_iter().enumerate().rev() {
             let button = self.data_buttons[group][index];
-            let show_button = visible && active && (index != 3 || web);
+            let show_button = visible && active && max_width > 0 && (index != 3 || web);
             if show_button {
-                let width = self.px(width).min(area.width() / count);
+                let width = self.px(width).min(max_width);
                 x -= width;
-                place(
-                    button,
-                    x,
-                    area.top + 1,
-                    width - self.px(4),
-                    area.height() - 2,
-                );
+                place(button, x, area.top + 1, width, area.height() - 2);
             }
             show(button, show_button);
         }
@@ -568,6 +574,7 @@ impl App {
             }
         }
         self.activate(index, true);
+        self.redraw_terminal();
         for button in self.data_buttons.into_iter().flatten() {
             repaint(button);
         }
@@ -592,7 +599,11 @@ impl App {
             title(view.notice, &message);
             self.report(&message);
         }
-        self.layout_data_panels();
+        let group = self.documents[index].group;
+        if self.group_document(group) != Some(index) {
+            return;
+        }
+        self.layout();
         if self.active == Some(index)
             && self.documents[index].data_mode() != ViewMode::Raw
             && self
@@ -603,6 +614,7 @@ impl App {
         {
             self.focus_editor();
         }
+        self.redraw_terminal();
     }
 
     pub(super) fn layout_data_panels(&self) {

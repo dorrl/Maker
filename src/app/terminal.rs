@@ -14,12 +14,12 @@ pub(super) const DOCK_BOTTOM: usize = 143;
 pub(super) const DOCK_LEFT: usize = 144;
 pub(super) const DOCK_RIGHT: usize = 145;
 pub(super) const CLOSE_TAB: usize = 146;
-pub(super) const SIDEBAR_VIEW: usize = 409;
 pub(super) const DOCK_SIDEBAR: usize = 410;
 pub(super) const MENU: usize = 147;
 pub(super) const TIMER: usize = 3;
-const HEADER: usize = 340;
-const BODY: usize = 341;
+pub(super) const RESIZE_TIMER: usize = 13;
+pub(super) const HEADER: usize = 340;
+pub(super) const BODY: usize = 341;
 const DIVIDER: usize = 342;
 const CLASS: &str = "MakerTerminalPanel";
 const WM_CHAR: u32 = 0x0102;
@@ -165,8 +165,6 @@ enum BodyDrag {
 
 pub(super) struct Panel {
     header: Handle,
-    pub(super) sidebar_button: Handle,
-    sidebar_revealing: bool,
     body: Handle,
     divider: Handle,
     pub(super) visible: bool,
@@ -181,6 +179,7 @@ pub(super) struct Panel {
     tab_drag: Option<(usize, Point)>,
     divider_hover: bool,
     panel_drag: Option<PanelDrag>,
+    pending_resize: Option<Point>,
     body_drag: Option<BodyDrag>,
     high_surrogate: Option<u16>,
 }
@@ -218,14 +217,6 @@ impl Panel {
         }
     }
     pub(super) fn new(window: Handle) -> io::Result<Self> {
-        let sidebar_button = child(
-            window,
-            SIDEBAR_VIEW,
-            "BUTTON",
-            crate::i18n::text("ui.sidebar.terminal"),
-            BS_OWNERDRAW | WS_TABSTOP,
-        )?;
-        chrome::watch_control(sidebar_button, true);
         Ok(Self {
             header: child(
                 window,
@@ -234,8 +225,6 @@ impl Panel {
                 crate::i18n::text("ui.terminal.tab"),
                 0,
             )?,
-            sidebar_button,
-            sidebar_revealing: false,
             body: child(
                 window,
                 BODY,
@@ -262,6 +251,7 @@ impl Panel {
             tab_drag: None,
             divider_hover: false,
             panel_drag: None,
+            pending_resize: None,
             body_drag: None,
             high_surrogate: None,
         })
@@ -345,11 +335,7 @@ extern "system" fn proc(window: Handle, msg: u32, wp: usize, lp: isize) -> isize
                 }
             };
             if msg == WM_PAINT {
-                if id == HEADER {
-                    buffered_paint(window, draw);
-                } else {
-                    paint(window, draw);
-                }
+                buffered_paint(window, draw);
             } else {
                 draw(wp as Handle, bounds(window));
             }
@@ -375,7 +361,7 @@ extern "system" fn proc(window: Handle, msg: u32, wp: usize, lp: isize) -> isize
             return 0;
         }
         WM_SETFOCUS | WM_KILLFOCUS => {
-            redraw(window);
+            repaint(window);
         }
         WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK
         | WM_MBUTTONDOWN | WM_MOUSEWHEEL | WM_CAPTURECHANGED | WM_RBUTTONUP => {
@@ -416,36 +402,61 @@ impl App {
         self.activate_terminal(active);
     }
 
-    pub(super) fn terminal_in_sidebar(&self) -> bool {
-        self.terminal.visible && self.settings.terminal_dock == TerminalDock::Sidebar
-    }
-
-    pub(super) fn leave_sidebar_terminal(&mut self) {
-        if self.terminal_in_sidebar() {
-            self.terminal.visible = false;
-            self.terminal.sidebar_revealing = false;
+    fn terminal_edge(&self, dock: TerminalDock) -> TerminalDock {
+        if dock == TerminalDock::Sidebar {
+            if self.settings.sidebar_right {
+                TerminalDock::Right
+            } else {
+                TerminalDock::Left
+            }
+        } else {
+            dock
         }
     }
 
-    pub(super) fn terminal_sidebar_area(&self) -> Rect {
-        self.dock.terminal_sidebar
+    pub(super) fn terminal_sidebar_panel(&self) -> Rect {
+        self.terminal_panel_geometry(self.terminal.area, TerminalDock::Sidebar)
+            .0
     }
 
-    fn sidebar_terminal_key(&self) -> motion::Key {
-        motion::Key::control(self.terminal.header, motion::Effect::Reveal)
-    }
-
-    pub(super) fn refresh_sidebar_terminal_reveal(&mut self) {
-        if self.terminal.sidebar_revealing {
-            self.terminal.sidebar_revealing = motion::active(self.sidebar_terminal_key());
-            self.terminal_layout(self.terminal.area);
+    pub(super) fn editor_drop_header(&self) -> Rect {
+        let area = if self.terminal.visible {
+            self.terminal_panel_geometry(self.terminal.area, self.settings.terminal_dock)
+                .2
+        } else {
+            self.terminal.area
+        };
+        Rect {
+            bottom: (area.top + self.px(34)).min(area.bottom),
+            ..area
         }
     }
 
-    fn dock_terminal_in_sidebar(&mut self) -> io::Result<()> {
+    pub(super) fn terminal_drop_header(&self) -> Rect {
+        let mut area = self.terminal.area;
+        let panel = if self.detached && self.documents.is_empty() {
+            area
+        } else {
+            if self.settings.terminal_dock == TerminalDock::Sidebar && !self.sidebar {
+                let sidebar = self.sidebar_size(bounds(self.window).width()) + self.px(7);
+                if self.settings.sidebar_right {
+                    area.right = (area.right - sidebar).max(area.left);
+                } else {
+                    area.left = (area.left + sidebar).min(area.right);
+                }
+            }
+            self.terminal_panel_geometry(area, self.settings.terminal_dock)
+                .0
+        };
+        Rect {
+            bottom: (panel.top + self.px(31)).min(panel.bottom),
+            ..panel
+        }
+    }
+
+    fn dock_terminal_beside_sidebar(&mut self) -> io::Result<()> {
         self.sidebar = true;
         self.settings.terminal_dock = TerminalDock::Sidebar;
-        self.terminal.sidebar_revealing = false;
         if self.terminal.is_empty() {
             self.add_terminal(Shell::PowerShell)?;
         } else {
@@ -453,55 +464,19 @@ impl App {
             self.layout();
             self.activate_terminal(self.terminal.active);
         }
-        let key = self.sidebar_terminal_key();
-        motion::animate(self.window, key, motion::Area::Control, false, true);
-        self.terminal.sidebar_revealing = motion::active(key);
-        self.terminal_layout(self.terminal.area);
         self.settings.save()
     }
 
-    pub(super) fn terminal_layout(&mut self, area: Rect) -> Rect {
-        self.terminal.area = area;
-        let sidebar = self.terminal_sidebar_area();
-        if !self.terminal.visible || self.terminal_in_sidebar() && sidebar.width() <= 0 {
-            for handle in [
-                self.terminal.header,
-                self.terminal.body,
-                self.terminal.divider,
-            ] {
-                show(handle, false);
-            }
-            return area;
-        }
-        let divider = self.px(6);
-        let header = self.px(31);
-        let dock = self.settings.terminal_dock;
-        let size = self.terminal_extent(dock, area);
-        let fills_window = self.detached && self.documents.is_empty();
-        let (panel, edge, editor) = match dock {
-            TerminalDock::Sidebar => {
-                let progress = motion::value(self.sidebar_terminal_key(), true);
-                let height = ((sidebar.height() as f32 * progress) as i32)
-                    .max(header + self.px(3))
-                    .min(sidebar.height());
-                (
-                    Rect {
-                        bottom: sidebar.top + height,
-                        ..sidebar
-                    },
-                    Rect::default(),
-                    area,
-                )
-            }
-            _ if fills_window => (
-                area,
-                Rect::default(),
-                Rect {
-                    right: area.left,
-                    bottom: area.top,
-                    ..area
-                },
-            ),
+    fn terminal_panel_geometry(&self, area: Rect, dock: TerminalDock) -> (Rect, Rect, Rect) {
+        let edge = self.terminal_edge(dock);
+        let extent = if edge == TerminalDock::Bottom {
+            area.height()
+        } else {
+            area.width()
+        };
+        let divider = self.px(6).min(extent);
+        let size = self.terminal_extent(edge, area).min(extent - divider);
+        match edge {
             TerminalDock::Bottom => {
                 let split = area.bottom - size;
                 (
@@ -541,13 +516,39 @@ impl App {
                     },
                 )
             }
+            TerminalDock::Sidebar => unreachable!("sidebar dock resolves to a window edge"),
+        }
+    }
+
+    pub(super) fn terminal_layout(&mut self, area: Rect) -> Rect {
+        self.terminal.area = area;
+        if !self.terminal.visible {
+            for handle in [
+                self.terminal.header,
+                self.terminal.body,
+                self.terminal.divider,
+            ] {
+                show(handle, false);
+            }
+            return area;
+        }
+        let fills_window = self.detached && self.documents.is_empty();
+        let (panel, edge, editor) = if fills_window {
+            (
+                area,
+                Rect::default(),
+                Rect::from_size(area.left, area.top, 0, 0),
+            )
+        } else {
+            self.terminal_panel_geometry(area, self.settings.terminal_dock)
         };
+        let header = self.px(31).min(panel.height());
         place(
             self.terminal.header,
             panel.left,
             panel.top,
             panel.width(),
-            header.min(panel.height()),
+            header,
         );
         place(
             self.terminal.body,
@@ -556,22 +557,33 @@ impl App {
             panel.width(),
             panel.height() - header,
         );
-        show(self.terminal.header, true);
-        show(self.terminal.body, panel.height() > header);
-        if fills_window || dock == TerminalDock::Sidebar {
-            show(self.terminal.divider, false);
-        } else {
+        show(self.terminal.header, panel.width() > 0 && header > 0);
+        show(
+            self.terminal.body,
+            panel.width() > 0 && panel.height() > header,
+        );
+        if edge.width() > 0 && edge.height() > 0 {
             show_overlay(self.terminal.divider, edge);
+        } else {
+            show(self.terminal.divider, false);
+        }
+        editor
+    }
+
+    pub(super) fn update_terminal_geometry(&mut self) {
+        if !self.terminal.visible {
+            return;
         }
         self.terminal.reveal_tab(self.dpi);
-        let size = self.terminal.inner_size(self.dpi);
-        if !self.terminal.sidebar_revealing
-            && let Some(tab) = self.terminal.active_mut()
-        {
-            tab.resize(size);
+        if self.terminal.panel_drag.is_none() {
+            let size = self.terminal.inner_size(self.dpi);
+            if let Some(tab) = self.terminal.active_mut()
+                && tab.screen.shape() != (size.cols as usize, size.rows as usize)
+            {
+                tab.resize(size);
+                repaint(self.terminal.body);
+            }
         }
-        self.redraw_terminal();
-        editor
     }
 
     fn terminal_extent(&self, dock: TerminalDock, area: Rect) -> i32 {
@@ -590,14 +602,11 @@ impl App {
 
     pub(super) fn terminal_command(&mut self, id: usize) -> io::Result<()> {
         match id {
-            SIDEBAR_VIEW if self.terminal_in_sidebar() => self.hide_terminal(),
-            TOGGLE if self.terminal.visible && (!self.terminal_in_sidebar() || self.sidebar) => {
-                self.hide_terminal()
-            }
+            TOGGLE if self.terminal.visible => self.hide_terminal(),
             TOGGLE if self.settings.terminal_dock == TerminalDock::Sidebar => {
-                self.dock_terminal_in_sidebar()?
+                self.dock_terminal_beside_sidebar()?
             }
-            SIDEBAR_VIEW | DOCK_SIDEBAR => self.dock_terminal_in_sidebar()?,
+            DOCK_SIDEBAR => self.dock_terminal_beside_sidebar()?,
 
             TOGGLE if !self.terminal.tabs.is_empty() => {
                 self.terminal.visible = true;
@@ -790,25 +799,34 @@ impl App {
         }
     }
 
-    fn redraw_terminal(&self) {
+    pub(super) fn redraw_terminal(&self) {
         if self.terminal.visible {
-            redraw(self.terminal.header);
-            redraw(self.terminal.body);
-            redraw(self.terminal.divider);
+            repaint(self.terminal.header);
+            repaint(self.terminal.body);
+            repaint(self.terminal.divider);
         }
     }
 
     pub(super) fn terminal_tick(&mut self) {
-        let mut changed = false;
-        let mut active = false;
-        for tab in &mut self.terminal.tabs {
-            changed |= tab.drain();
-            active |= tab.session.is_some();
+        let mut body_changed = false;
+        let mut header_changed = false;
+        let mut running = false;
+        for (index, tab) in self.terminal.tabs.iter_mut().enumerate() {
+            let was_running = tab.session.is_some();
+            let changed = tab.drain();
+            body_changed |= changed && index == self.terminal.active;
+            header_changed |= was_running != tab.session.is_some();
+            running |= tab.session.is_some();
         }
-        if changed {
-            self.redraw_terminal();
+        if self.terminal.visible {
+            if body_changed {
+                repaint(self.terminal.body);
+            }
+            if header_changed {
+                repaint(self.terminal.header);
+            }
         }
-        if !active {
+        if !running {
             unsafe {
                 KillTimer(self.window, TIMER);
             }
@@ -895,7 +913,7 @@ impl App {
         };
         if let Some(bytes) = sequence {
             tab.send(bytes.to_vec());
-            redraw(self.terminal.body);
+            repaint(self.terminal.body);
             return true;
         }
         false
@@ -919,7 +937,7 @@ impl App {
         {
             let ch = if ch == '\x08' { '\x7f' } else { ch };
             tab.send(ch.encode_utf8(&mut [0; 4]).as_bytes().to_vec());
-            redraw(self.terminal.body);
+            repaint(self.terminal.body);
         }
     }
 
@@ -949,13 +967,13 @@ impl App {
             normalized
         };
         tab.send(paste.into_bytes());
-        redraw(self.terminal.body);
+        repaint(self.terminal.body);
     }
 
     fn terminal_scroll(&mut self, delta: i32) {
         if let Some(tab) = self.terminal.active_mut() {
             tab.scroll = (tab.scroll as i32 + delta).clamp(0, tab.screen.history() as i32) as usize;
-            redraw(self.terminal.body);
+            repaint(self.terminal.body);
         }
     }
 
@@ -974,65 +992,34 @@ impl App {
     fn terminal_divider_mouse(&mut self, window: Handle, msg: u32, point: Point) {
         let previous = self.terminal.divider_hover || self.terminal.panel_drag.is_some();
         let point = map_point(window, self.window, point);
-        let area = self.terminal.area;
-        let dock = self.settings.terminal_dock;
         match msg {
             WM_LBUTTONDOWN => {
+                let dock = self.settings.terminal_dock;
                 self.terminal.panel_drag = Some(PanelDrag {
                     anchor: point,
                     dock,
-                    value: self.terminal_extent(dock, area),
+                    value: self.terminal_extent(self.terminal_edge(dock), self.terminal.area),
                 });
-                unsafe {
-                    SetCapture(window);
-                }
+                unsafe { SetCapture(window) };
             }
             WM_MOUSEMOVE => {
                 self.terminal.divider_hover = true;
-                if let Some(drag) = self.terminal.panel_drag {
-                    let x = point.x - area.left;
-                    let y = point.y - area.top;
-                    let target = if drag.dock != TerminalDock::Bottom && y > area.height() * 4 / 5 {
-                        TerminalDock::Bottom
-                    } else if drag.dock != TerminalDock::Left
-                        && x < area.width() / 6
-                        && (drag.dock != TerminalDock::Bottom
-                            || (point.x - drag.anchor.x).abs() > self.px(72))
-                    {
-                        TerminalDock::Left
-                    } else if drag.dock != TerminalDock::Right
-                        && x > area.width() * 5 / 6
-                        && (drag.dock != TerminalDock::Bottom
-                            || (point.x - drag.anchor.x).abs() > self.px(72))
-                    {
-                        TerminalDock::Right
-                    } else {
-                        drag.dock
-                    };
-                    self.settings.terminal_dock = target;
-                    if target == drag.dock {
-                        let delta = match target {
-                            TerminalDock::Bottom => drag.anchor.y - point.y,
-                            TerminalDock::Left => point.x - drag.anchor.x,
-                            TerminalDock::Right => drag.anchor.x - point.x,
-                            TerminalDock::Sidebar => return,
-                        };
-                        let size = (drag.value + delta).max(0) * 96 / self.dpi;
-                        match target {
-                            TerminalDock::Bottom => {
-                                self.settings.terminal_height = size.clamp(112, 1600)
-                            }
-                            _ => self.settings.terminal_width = size.clamp(196, 2400),
-                        }
-                    }
-                    self.layout();
+                if self.terminal.panel_drag.is_some()
+                    && self.terminal.pending_resize.replace(point).is_none()
+                    && unsafe { SetTimer(self.window, RESIZE_TIMER, 16, 0) } == 0
+                {
+                    self.flush_terminal_resize();
                 }
             }
-            WM_LBUTTONUP | WM_CAPTURECHANGED if self.terminal.panel_drag.take().is_some() => {
+            WM_LBUTTONUP | WM_CAPTURECHANGED if self.terminal.panel_drag.is_some() => {
                 if msg == WM_LBUTTONUP {
-                    unsafe {
-                        ReleaseCapture();
-                    }
+                    self.terminal.pending_resize = Some(point);
+                }
+                self.flush_terminal_resize();
+                self.terminal.panel_drag = None;
+                self.update_terminal_geometry();
+                if msg == WM_LBUTTONUP {
+                    unsafe { ReleaseCapture() };
                 }
                 self.save_sidebar_settings();
             }
@@ -1058,6 +1045,55 @@ impl App {
         }
     }
 
+    pub(super) fn flush_terminal_resize(&mut self) {
+        let Some(point) = self.terminal.pending_resize.take() else {
+            return;
+        };
+        unsafe { KillTimer(self.window, RESIZE_TIMER) };
+        let Some(drag) = self.terminal.panel_drag else {
+            return;
+        };
+        let area = self.terminal.area;
+        let x = point.x - area.left;
+        let y = point.y - area.top;
+        let dx = point.x - drag.anchor.x;
+        let dy = point.y - drag.anchor.y;
+        let target = if drag.dock == TerminalDock::Sidebar {
+            TerminalDock::Sidebar
+        } else if drag.dock != TerminalDock::Bottom && dy > self.px(72) && y > area.height() * 4 / 5
+        {
+            TerminalDock::Bottom
+        } else if drag.dock != TerminalDock::Left && x < area.width() / 6 && dx < -self.px(72) {
+            TerminalDock::Left
+        } else if drag.dock != TerminalDock::Right && x > area.width() * 5 / 6 && dx > self.px(72) {
+            TerminalDock::Right
+        } else {
+            drag.dock
+        };
+        let mut changed = target != self.settings.terminal_dock;
+        self.settings.terminal_dock = target;
+        if target == drag.dock {
+            let edge = self.terminal_edge(target);
+            let delta = match edge {
+                TerminalDock::Bottom => -dy,
+                TerminalDock::Left => dx,
+                TerminalDock::Right => -dx,
+                TerminalDock::Sidebar => unreachable!(),
+            };
+            let size = (drag.value + delta).max(0) * 96 / self.dpi;
+            let (setting, next) = if edge == TerminalDock::Bottom {
+                (&mut self.settings.terminal_height, size.clamp(112, 1600))
+            } else {
+                (&mut self.settings.terminal_width, size.clamp(196, 2400))
+            };
+            changed |= *setting != next;
+            *setting = next;
+        }
+        if changed {
+            self.layout_geometry();
+        }
+    }
+
     fn terminal_tab_cell(&self, index: usize) -> Option<Rect> {
         let area = bounds(self.terminal.header);
         let (left, room, _) = self.terminal.controls(area, self.dpi);
@@ -1078,7 +1114,8 @@ impl App {
     fn sidebar_drop_from(&self, header: Handle, point: Point) -> bool {
         self.sidebar
             && self
-                .terminal_sidebar_area()
+                .dock
+                .terminal_sidebar
                 .has(map_point(header, self.window, point))
     }
 
@@ -1089,12 +1126,15 @@ impl App {
             let moved = (point.x - origin.x).abs().max((point.y - origin.y).abs()) >= self.px(7);
             match msg {
                 WM_MOUSEMOVE if moved => {
-                    if rect.has(point) || self.transfer_target(header, point).is_some() {
+                    if rect.has(point) {
                         self.clear_dock();
-                    } else if self.sidebar_drop_from(header, point) {
-                        self.show_dock(dock::Destination::TerminalSidebar);
-                    } else {
-                        self.show_dock(dock::Destination::Window);
+                    } else if !self.preview_tab_transfer(header, point, dock::TabKind::Terminal) {
+                        let target = if self.sidebar_drop_from(header, point) {
+                            dock::Destination::TerminalSidebar
+                        } else {
+                            dock::Destination::Window
+                        };
+                        self.show_dock(target);
                     }
                 }
                 WM_LBUTTONUP => {
@@ -1107,7 +1147,7 @@ impl App {
                         let destination = self.transfer_target(header, point);
                         let result =
                             if destination.is_none() && self.sidebar_drop_from(header, point) {
-                                self.dock_terminal_in_sidebar()
+                                self.dock_terminal_beside_sidebar()
                             } else {
                                 self.detach_terminal(index, destination)
                             };
@@ -1250,7 +1290,7 @@ impl App {
             },
             _ => {}
         }
-        redraw(body);
+        repaint(body);
     }
 
     fn terminal_cell(&self, point: Point) -> Option<CellPos> {
@@ -1435,6 +1475,7 @@ impl App {
             y: self.px(6),
         };
         let (cols, rows) = tab.screen.shape();
+        let cols = cols.min(((rect.width() - self.px(26)) / cell.x).max(0) as usize);
         let history = tab.screen.history();
         let first = history.saturating_sub(tab.scroll);
         let selection = tab

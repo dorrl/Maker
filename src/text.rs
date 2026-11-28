@@ -460,16 +460,19 @@ pub fn tokens(text: &str, lang: Language) -> Vec<Token> {
     }
     if lang == Language::Diff {
         let mut start = 0;
+        let mut file_headers = false;
         return text
             .split_inclusive('\n')
             .filter_map(|line| {
                 let at = start;
                 start += line.len();
-                let color = if line.starts_with("+++ ")
-                    || line.starts_with("--- ")
-                    || line.starts_with("diff ")
-                    || line.starts_with("@@")
-                {
+                let color = if line.starts_with("diff ") {
+                    file_headers = true;
+                    Color::Markup
+                } else if line.starts_with("@@") {
+                    file_headers = false;
+                    Color::Markup
+                } else if file_headers && (line.starts_with("+++ ") || line.starts_with("--- ")) {
                     Color::Markup
                 } else if line.starts_with('+') {
                     Color::DiffAdded

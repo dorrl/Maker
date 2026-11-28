@@ -25,8 +25,12 @@
     "bracket_0": [137, 94, 8],
     "bracket_1": [145, 43, 121],
     "bracket_2": [17, 93, 159],
-    "unmatched_bracket": [184, 38, 48],
-    "diff_added": [22, 107, 65],
-    "diff_removed": [156, 44, 52]
+    "unmatched_bracket": [184, 38, 48]
+  },
+  "diff": {
+    "added_text": [22, 107, 65],
+    "added_background": [224, 239, 215],
+    "removed_text": [156, 44, 52],
+    "removed_background": [249, 225, 220]
   }
 }

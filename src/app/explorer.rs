@@ -3,8 +3,10 @@ use super::*;
 pub(super) const NEW_FILE: usize = 350;
 pub(super) const NEW_FOLDER: usize = 351;
 pub(super) const NAME: usize = 352;
+pub(super) const NAME_FRAME: usize = 353;
+pub(super) const CANCEL_EDIT: u32 = 0x8051;
 
-pub(super) enum Edit {
+enum Edit {
     Create { parent: PathBuf, folder: bool },
     Rename { path: PathBuf },
 }
@@ -13,7 +15,8 @@ pub(super) struct Explorer {
     pub file: Handle,
     pub folder: Handle,
     pub input: Handle,
-    pub edit: Option<Edit>,
+    pub frame: Handle,
+    edit: Option<(usize, Edit)>,
     pub selected: Vec<PathBuf>,
     pub archive: archive::Panel,
 }
@@ -28,13 +31,8 @@ impl Explorer {
         Ok(Self {
             file,
             folder,
-            input: child(
-                window,
-                NAME,
-                "EDIT",
-                "",
-                WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-            )?,
+            frame: child(window, NAME_FRAME, chrome::SURFACE, "", 0)?,
+            input: child(window, NAME, "EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL)?,
             edit: None,
             selected: Vec::new(),
             archive: archive::Panel::default(),
@@ -79,6 +77,10 @@ pub(super) fn paint_button(item: &DrawItem, palette: Paint) {
 }
 
 impl App {
+    pub(super) fn explorer_editing(&self) -> bool {
+        self.explorer.edit.is_some()
+    }
+
     pub(super) fn layout_explorer_buttons(&self, title_area: Rect) {
         let visible = self.sidebar
             && self.root.is_some()
@@ -105,47 +107,117 @@ impl App {
     }
 
     pub(super) fn layout_explorer_edit(&self) {
-        if !self.sidebar
-            || !self.is_tree()
-            || !matches!(self.explorer.edit, Some(Edit::Create { .. }))
-        {
+        let Some(frame) = self.explorer_edit_rect() else {
             show(self.explorer.input, false);
+            show(self.explorer.frame, false);
             return;
-        }
-        let list = relative_rect(self.list, self.window);
-        show_overlay(
-            self.explorer.input,
-            Rect::from_size(
-                list.left + self.px(13),
-                list.top - self.px(28),
-                (list.width() - self.px(77)).max(0),
-                self.px(24),
-            ),
+        };
+        let input_height = self.px(17).min(frame.height() - 2);
+        let input = Rect::from_size(
+            frame.left + self.px(4),
+            frame.top + (frame.height() - input_height) / 2,
+            frame.width() - self.px(8),
+            input_height,
         );
+        for (window, area) in [(self.explorer.frame, frame), (self.explorer.input, input)] {
+            if unsafe { IsWindowVisible(window) } == 0 || relative_rect(window, self.window) != area
+            {
+                show_overlay(window, area);
+            }
+        }
     }
 
-    fn start_explorer_edit(&mut self, edit: Edit, name: &str, select_length: i32) {
-        self.explorer.edit = Some(edit);
+    fn explorer_edit_rect(&self) -> Option<Rect> {
+        let (row, _) = self.explorer.edit.as_ref()?;
+        if !self.sidebar || !self.is_tree() {
+            return None;
+        }
+        let item = list_item_rect(self.list, *row)?;
+        let viewport = bounds(self.list);
+        if item.top < viewport.top || item.bottom > viewport.bottom {
+            return None;
+        }
+        let data = send(self.list, LB_GETITEMDATA, *row, 0) as usize;
+        let left =
+            item.left + chrome::file_row_label_left(data >> 8, item.width(), self.dpi) - self.px(4);
+        let right = viewport.right - self.px(4);
+        if right - left < self.px(40) {
+            return None;
+        }
+        let origin = map_point(self.list, self.window, Point::default());
+        Some(Rect::from_size(
+            origin.x + left,
+            origin.y + item.top + 1,
+            right - left,
+            item.height() - 2,
+        ))
+    }
+
+    fn start_explorer_edit(&mut self, row: usize, edit: Edit, name: &str, select_length: isize) {
+        self.dismiss_completion();
+        let hint = match &edit {
+            Edit::Create { folder: true, .. } => crate::i18n::text("ui.folder.name"),
+            Edit::Create { folder: false, .. } => crate::i18n::text("ui.file.name"),
+            Edit::Rename { .. } => "",
+        };
+        self.explorer.edit = Some((row, edit));
+        let cue: Vec<u16> = hint.encode_utf16().chain([0]).collect();
+        send(self.explorer.input, 0x1501, 1, cue.as_ptr() as isize);
         title(self.explorer.input, name);
+        self.reveal_explorer_row(row);
+        self.sync_scrollbars();
         self.layout_explorer_edit();
-        send(self.explorer.input, 0x00b1, 0, select_length as isize);
+        if self.explorer_edit_rect().is_none() {
+            self.cancel_explorer_edit(true);
+            self.report(crate::i18n::text("ui.explorer.name_space"));
+            return;
+        }
         unsafe {
             SetFocus(self.explorer.input);
+        }
+        send(self.explorer.input, 0x00b1, 0, select_length);
+    }
+
+    fn reveal_explorer_row(&self, row: usize) {
+        let height = bounds(self.list).height();
+        if let Some(item) = list_item_rect(self.list, row)
+            && (item.top < 0 || item.bottom > height)
+        {
+            let visible = (height / item.height().max(1)).max(1) as usize;
+            let top = if item.top < 0 {
+                row
+            } else {
+                (row + 1).saturating_sub(visible)
+            };
+            send(self.list, LB_SETTOPINDEX, top, 0);
         }
     }
 
     pub(super) fn cancel_explorer_edit(&mut self, focus: bool) {
-        if self.explorer.edit.take().is_some() {
-            show(self.explorer.input, false);
-            if focus && self.sidebar {
-                unsafe {
-                    SetFocus(self.list);
-                }
+        let Some((row, edit)) = self.explorer.edit.take() else {
+            return;
+        };
+        show(self.explorer.input, false);
+        show(self.explorer.frame, false);
+        if matches!(edit, Edit::Create { .. }) {
+            chrome::reset_file_motion(self.list);
+            self.list_items.remove(row);
+            send(self.list, LB_DELETESTRING, row, 0);
+            self.redraw_scroll_position(self.list);
+        }
+        if focus && self.sidebar {
+            self.report("");
+            unsafe {
+                SetFocus(self.list);
             }
         }
     }
 
     pub(super) fn new_explorer_item(&mut self, folder: bool) -> io::Result<()> {
+        self.cancel_explorer_edit(false);
+        if !self.sidebar || !self.is_tree() {
+            return Ok(());
+        }
         let Some(root) = self.root.as_ref() else {
             return Err(io::Error::other(crate::i18n::text(
                 "ui.open.a.workspace.folder.first",
@@ -164,20 +236,54 @@ impl App {
             })
             .unwrap_or(root)
             .to_owned();
+        let depth = parent
+            .strip_prefix(root)
+            .map_or(0, |path| path.components().count());
+        if depth > 0 && !self.expanded.contains(&parent) {
+            self.expanded.insert(parent.clone());
+            self.show_files("");
+        }
+        let mut row = if depth == 0 {
+            0
+        } else {
+            let Some(row) = self.list_items.iter().position(
+                |item| matches!(item, ListItem::Folder { path, open: true, .. } if path == &parent),
+            ) else {
+                return Ok(());
+            };
+            row + 1
+        };
+        if !folder {
+            while self.list_items.get(row).is_some_and(|item| match item {
+                ListItem::Folder { depth: level, .. } => *level >= depth,
+                ListItem::Archive { depth: level, .. }
+                | ListItem::ArchiveMember { depth: level, .. }
+                | ListItem::File(_, Some(level)) => *level > depth,
+                _ => false,
+            }) {
+                row += 1;
+            }
+        }
+        let icon = if folder {
+            chrome::folder_icon(Path::new(""), false)
+        } else {
+            chrome::file_icon(None)
+        };
+        chrome::reset_file_motion(self.list);
+        insert_list_entry(self.list, row, (depth << 8) | icon)?;
+        self.list_items.insert(row, ListItem::Draft);
         self.report(if folder {
             crate::i18n::text("ui.enter.a.new.folder.name.and.press")
         } else {
             crate::i18n::text("ui.enter.a.new.file.name.and.press")
         });
-        if self.mode == Some(Mode::Rename) {
-            self.clear_mode();
-        }
-        self.start_explorer_edit(Edit::Create { parent, folder }, "", -1);
+        self.start_explorer_edit(row, Edit::Create { parent, folder }, "", -1);
         Ok(())
     }
 
     pub(super) fn rename_explorer_item(&mut self) {
-        if !self.is_tree() {
+        self.cancel_explorer_edit(false);
+        if !self.sidebar || !self.is_tree() {
             return;
         }
         let selected = list_selection(self.list);
@@ -186,46 +292,26 @@ impl App {
             return;
         }
         let row = selected[0];
-        let Some((path, _)) = self.list_items.get(row).and_then(row_path) else {
+        let Some(path) = self.list_items.get(row).and_then(row_path) else {
             return;
         };
         let path = path.to_owned();
         let label = file_name(&path).into_owned();
-        let basename = if path.is_file() {
+        let basename = if !matches!(self.list_items[row], ListItem::Folder { .. }) {
             path.file_stem().and_then(OsStr::to_str).unwrap_or(&label)
         } else {
             &label
         };
-        self.show_mode(Mode::Rename);
-        self.explorer.edit = Some(Edit::Rename { path: path.clone() });
-        title(
-            self.mode_label,
-            if path.is_file() {
-                crate::i18n::text("ui.file.name")
-            } else {
-                crate::i18n::text("ui.folder.name")
-            },
-        );
-        title(self.query, &label);
-        send(
-            self.query,
-            0x00b1,
-            0,
-            basename.encode_utf16().count() as isize,
-        );
+        let select_length = basename.encode_utf16().count() as isize;
+        self.start_explorer_edit(row, Edit::Rename { path }, &label, select_length);
     }
 
     pub(super) fn commit_explorer_edit(&mut self) -> io::Result<()> {
-        let rename = matches!(self.explorer.edit, Some(Edit::Rename { .. }));
-        let name = caption(if rename {
-            self.query
-        } else {
-            self.explorer.input
-        });
-        validate_component(&name)?;
-        let Some(edit) = self.explorer.edit.as_ref() else {
+        let Some((_, edit)) = self.explorer.edit.as_ref() else {
             return Ok(());
         };
+        let name = caption(self.explorer.input);
+        validate_component(&name)?;
         let (target, new_file) = match edit {
             Edit::Create { parent, folder } => {
                 let target = parent.join(&name);
@@ -250,9 +336,6 @@ impl App {
             }
         };
         self.cancel_explorer_edit(false);
-        if rename {
-            self.mode = None;
-        }
         self.search = None;
         self.showing_issues = false;
         if let Some(root) = self.root.as_ref() {
@@ -263,22 +346,20 @@ impl App {
             {
                 self.expanded.insert(parent.to_owned());
             }
-            if let Ok(files) = text::files(root) {
-                self.files = files;
-            }
         }
+        self.files_stale = true;
         self.explorer_selection = Some(target.clone());
         self.explorer.selected.clear();
+        self.explorer_top = send(self.list, LB_GETTOPINDEX, 0, 0).max(0) as usize;
         self.show_files("");
-        if rename {
-            self.layout();
-        }
         if let Some(row) = self
             .list_items
             .iter()
-            .position(|item| row_path(item).is_some_and(|(path, _)| path == target))
+            .position(|item| row_path(item) == Some(target.as_path()))
         {
-            list_select(self.list, row);
+            self.reveal_explorer_row(row);
+            self.redraw_scroll_position(self.list);
+            self.remember_tree_focus(row, target.clone());
         }
         if new_file {
             self.open_path(&target)?;
@@ -305,14 +386,14 @@ impl App {
                 self.list_items
                     .get(*row)
                     .and_then(row_path)
-                    .map(|(path, _)| path.to_owned())
+                    .map(Path::to_owned)
             })
             .collect();
         let row = list_caret(self.list)
             .filter(|row| rows.contains(row))
             .or_else(|| rows.last().copied())
             .unwrap_or(usize::MAX);
-        if let Some((path, _)) = self.list_items.get(row).and_then(row_path) {
+        if let Some(path) = self.list_items.get(row).and_then(row_path) {
             self.remember_tree_focus(row, path.to_owned());
         } else {
             self.explorer_selection = None;
@@ -326,7 +407,7 @@ impl App {
             return Ok(());
         };
         let mut paths: Vec<PathBuf> = Vec::new();
-        for (path, _) in list_selection(self.list)
+        for path in list_selection(self.list)
             .into_iter()
             .filter_map(|row| row_path(self.list_items.get(row)?))
         {
@@ -469,11 +550,11 @@ impl App {
     }
 }
 
-fn row_path(item: &ListItem) -> Option<(&Path, usize)> {
+pub(super) fn row_path(item: &ListItem) -> Option<&Path> {
     match item {
-        ListItem::Folder { path, depth, .. }
-        | ListItem::Archive { path, depth, .. }
-        | ListItem::File(path, Some(depth)) => Some((path, *depth)),
+        ListItem::Folder { path, .. }
+        | ListItem::Archive { path, .. }
+        | ListItem::File(path, Some(_)) => Some(path),
         _ => None,
     }
 }
@@ -519,9 +600,9 @@ pub(super) fn validate_component(name: &str) -> io::Result<()> {
             ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
         })
     {
-        Err(io::Error::other(
-            "Windows에서 사용할 수 있는 파일 또는 폴더 이름을 입력하세요.",
-        ))
+        Err(io::Error::other(crate::i18n::text(
+            "ui.explorer.invalid_name",
+        )))
     } else {
         Ok(())
     }

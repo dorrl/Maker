@@ -11,6 +11,23 @@ pub(super) const CLOSE_SECONDARY: usize = 382;
 pub(super) const SIDEBAR_SPLITTER: usize = 383;
 pub(super) const WINDOW_DROP: u32 = 0x8024;
 pub(super) const WINDOW_RECEIPT: u32 = 0x8025;
+pub(super) const WINDOW_PREVIEW: u32 = 0x8029;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub(super) enum TabKind {
+    File = 1,
+    Terminal,
+}
+
+impl TabKind {
+    fn label(self) -> &'static str {
+        i18n::text(match self {
+            Self::File => "ui.drop.file.tab.here",
+            Self::Terminal => "ui.drop.terminal.tab.here",
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Destination {
@@ -106,6 +123,8 @@ pub(super) struct Dock {
     pub stacked: bool,
     pub ratio: i32,
     preview: Option<Destination>,
+    incoming_preview: Option<(TabKind, Rect)>,
+    preview_window: Option<Handle>,
     resizing: bool,
     list_drag: Option<ListDrag>,
     incoming: Option<mpsc::Receiver<Incoming>>,
@@ -157,6 +176,8 @@ impl Dock {
             stacked: false,
             ratio: 50,
             preview: None,
+            incoming_preview: None,
+            preview_window: None,
             resizing: false,
             list_drag: None,
             incoming: None,
@@ -258,6 +279,93 @@ impl App {
         .then_some(DropTarget { window, point })
     }
 
+    pub(super) fn preview_tab_transfer(
+        &mut self,
+        from: Handle,
+        point: Point,
+        kind: TabKind,
+    ) -> bool {
+        let target = self.transfer_target(from, point);
+        let next = target.as_ref().map(|target| target.window);
+        let unchanged = self.dock.preview_window == next;
+        if !unchanged {
+            self.clear_transfer_preview();
+            self.dock.preview_window = next;
+        }
+        let Some(target) = target else {
+            return false;
+        };
+        self.hide_local_dock();
+        if kind == TabKind::File || !unchanged {
+            let position = target.point.x as u16 as u32 | ((target.point.y as u16 as u32) << 16);
+            unsafe {
+                PostMessageW(
+                    target.window,
+                    WINDOW_PREVIEW,
+                    kind as usize,
+                    position as isize,
+                );
+            }
+        }
+        true
+    }
+
+    fn clear_transfer_preview(&mut self) {
+        if let Some(window) = self.dock.preview_window.take() {
+            unsafe { PostMessageW(window, WINDOW_PREVIEW, 0, 0) };
+        }
+    }
+
+    fn receiving_editor_group(&self, point: Point) -> usize {
+        let (_, second, _) = self.dock.panes(self.px(6));
+        usize::from(self.other.is_some() && second.has(point))
+    }
+
+    pub(super) fn receive_tab_preview(&mut self, kind: usize, point: Point) {
+        let target = match kind {
+            value if value == TabKind::File as usize => {
+                let group = self.receiving_editor_group(point);
+                let tabs = self.chrome.tab_handle(group);
+                let header = if is_shown(tabs) {
+                    relative_rect(tabs, self.window)
+                } else {
+                    self.editor_drop_header()
+                };
+                Some((TabKind::File, header))
+            }
+            value if value == TabKind::Terminal as usize => {
+                Some((TabKind::Terminal, self.terminal_drop_header()))
+            }
+            _ => None,
+        };
+        let preview = target.and_then(|(kind, header)| {
+            let inset = self.px(3);
+            let width = (header.width() - inset * 2).min(self.px(225));
+            let height = header.height() - inset * 2;
+            (width > 0 && height > 0).then(|| {
+                (
+                    kind,
+                    Rect::from_size(
+                        header.left + (header.width() - width) / 2,
+                        header.top + inset,
+                        width,
+                        height,
+                    ),
+                )
+            })
+        });
+        if self.dock.incoming_preview == preview {
+            return;
+        }
+        self.dock.incoming_preview = preview;
+        if let Some((_, area)) = preview {
+            show_overlay(self.dock.guide, area);
+            repaint(self.dock.guide);
+        } else if self.dock.preview.is_none() {
+            show(self.dock.guide, false);
+        }
+    }
+
     pub(super) fn receive_window_drops(&mut self) {
         // Synchronize with posting the message and queuing the payload.
         let incoming = {
@@ -269,10 +377,10 @@ impl App {
                 .flat_map(|inbox| inbox.try_iter())
                 .collect::<Vec<_>>()
         };
+        self.receive_tab_preview(0, Point::default());
         for item in incoming {
             if !matches!(item.transfer, Transfer::Terminal(_)) && self.other.is_some() {
-                let (_, right, _) = self.dock.panes(self.px(6));
-                if let Some(index) = self.group_document(usize::from(right.has(item.point))) {
+                if let Some(index) = self.group_document(self.receiving_editor_group(item.point)) {
                     self.activate(index, false);
                 }
             }
@@ -602,7 +710,7 @@ impl App {
         }
         self.dock.preview = Some(target);
         let area = if target == Destination::TerminalSidebar {
-            self.dock.terminal_sidebar
+            self.terminal_sidebar_panel()
         } else if target == Destination::Sidebar {
             self.dock.sidebar
         } else {
@@ -621,14 +729,15 @@ impl App {
                 Rect::from_size(area.right - width / 4 - gap, y, width / 4, height - gap * 2)
             }
             Destination::Top => Rect::from_size(x, y, width - gap * 2, height / 4),
-            Destination::Bottom | Destination::Sidebar | Destination::TerminalSidebar => {
-                Rect::from_size(
-                    x,
-                    area.bottom - height / 3 - gap,
-                    width - gap * 2,
-                    height / 3,
-                )
+            Destination::TerminalSidebar => {
+                Rect::from_size(x, y, width - gap * 2, height - gap * 2)
             }
+            Destination::Bottom | Destination::Sidebar => Rect::from_size(
+                x,
+                area.bottom - height / 3 - gap,
+                width - gap * 2,
+                height / 3,
+            ),
             Destination::Window => {
                 let button = width.min(self.px(200));
                 Rect::from_size(
@@ -654,7 +763,12 @@ impl App {
     }
 
     pub(super) fn clear_dock(&mut self) {
-        if self.dock.preview.take().is_some() {
+        self.clear_transfer_preview();
+        self.hide_local_dock();
+    }
+
+    fn hide_local_dock(&mut self) {
+        if self.dock.preview.take().is_some() && self.dock.incoming_preview.is_none() {
             show(self.dock.guide, false);
         }
     }
@@ -676,8 +790,25 @@ impl App {
                 }
             };
             fill(dc, edge, palette.border);
-        } else if let Some(target) = self.dock.preview {
-            let border = if target == Destination::TerminalSidebar {
+        } else {
+            let incoming = self.dock.incoming_preview;
+            let local = self.dock.preview;
+            let Some(label) = incoming.map(|(kind, _)| kind.label()).or_else(|| {
+                local.map(|target| {
+                    i18n::text(match target {
+                        Destination::Window => "ui.open.in.new.window",
+                        Destination::Sidebar => "ui.open.in.secondary.explorer",
+                        Destination::TerminalSidebar => "terminal.dock_sidebar",
+                        Destination::Left => "ui.open.on.the.left",
+                        Destination::Right => "ui.open.on.the.right",
+                        Destination::Top => "ui.open.above",
+                        Destination::Bottom => "ui.open.below",
+                    })
+                })
+            }) else {
+                return;
+            };
+            let border = if incoming.is_none() && local == Some(Destination::TerminalSidebar) {
                 let reveal = motion::value(
                     motion::Key::control(self.dock.guide, motion::Effect::Reveal),
                     true,
@@ -697,15 +828,6 @@ impl App {
                 },
                 palette.control,
             );
-            let label = match target {
-                Destination::Window => crate::i18n::text("ui.open.in.new.window"),
-                Destination::Sidebar => crate::i18n::text("ui.open.in.secondary.explorer"),
-                Destination::TerminalSidebar => crate::i18n::text("ui.open.terminal.in.sidebar"),
-                Destination::Left => crate::i18n::text("ui.open.on.the.left"),
-                Destination::Right => crate::i18n::text("ui.open.on.the.right"),
-                Destination::Top => crate::i18n::text("ui.open.above"),
-                Destination::Bottom => crate::i18n::text("ui.open.below"),
-            };
             draw_label(dc, area, label, palette.font, palette.foreground, true);
         }
     }
@@ -832,8 +954,10 @@ impl App {
                 && (point.y - drag.origin.y).abs() >= self.px(24);
         match event {
             WM_MOUSEMOVE => {
-                if moved && outside && self.transfer_target(control, point).is_none() {
-                    self.show_dock(target);
+                if moved && outside {
+                    if !self.preview_tab_transfer(control, point, TabKind::File) {
+                        self.show_dock(target);
+                    }
                 } else {
                     self.clear_dock();
                 }

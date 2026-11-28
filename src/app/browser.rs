@@ -368,6 +368,46 @@ pub(super) fn is_url(text: &str) -> bool {
             .is_some_and(|start| start.eq_ignore_ascii_case("https://"))
 }
 
+fn inferred_https_url(text: &str) -> Option<String> {
+    if text.contains('\\') || text.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return None;
+    }
+    let authority = text.split(['/', '?', '#']).next()?;
+    let host = if let Some((host, port)) = authority.split_once(':') {
+        if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        port.parse::<u16>().ok()?;
+        host
+    } else {
+        authority
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.parse::<std::net::Ipv4Addr>().is_err() {
+        let (_, suffix) = host.rsplit_once('.')?;
+        let dns_suffix = suffix.len() >= 2
+            && (suffix.bytes().all(|byte| byte.is_ascii_alphabetic())
+                || suffix
+                    .get(..4)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("xn--")));
+        if !dns_suffix
+            || host.len() > 253
+            || !host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+        {
+            return None;
+        }
+    }
+    Some(format!("https://{text}"))
+}
+
 fn target_path(base: &Path, text: &str) -> io::Result<PathBuf> {
     let path = Path::new(text);
     if path.is_absolute() {
@@ -867,36 +907,44 @@ impl App {
         if query.is_empty() {
             return Ok(());
         }
-        if is_url(query) {
-            let owner = if new_tab
-                || self
-                    .secondary_browser
-                    .as_ref()
-                    .is_some_and(|view| view.query == window)
-            {
-                self.new_browser()?;
-                let view = self.documents[self.active.unwrap()]
-                    .browser
-                    .as_ref()
-                    .unwrap();
-                title(view.query, query);
-                view.query
-            } else {
-                window
-            };
-            return self.start_http(owner, query.to_owned());
-        }
-        let view = self.browser_for_mut(window).expect("active browser");
-        if view.search_due || view.search.is_some() {
-            view.open_on_match = Some(new_tab);
-            return Ok(());
-        }
-        if let Some(row) = view.rows.first() {
-            let path = row.path.clone();
-            self.follow_browser_path(window, path, new_tab)
+        let url = if is_url(query) {
+            query.to_owned()
         } else {
-            Err(io::Error::other("해당 파일이나 폴더를 찾을 수 없습니다."))
-        }
+            let view = self.browser_for_mut(window).expect("active browser");
+            if view.search_due || view.search.is_some() {
+                view.open_on_match = Some(new_tab);
+                return Ok(());
+            }
+            let web = inferred_https_url(query);
+            let name = Path::new(query).file_name();
+            if let Some(row) = view.rows.first().filter(|row| {
+                web.is_none()
+                    || name
+                        .zip(row.path.file_name())
+                        .is_some_and(|(input, found)| input.eq_ignore_ascii_case(found))
+            }) {
+                let path = row.path.clone();
+                return self.follow_browser_path(window, path, new_tab);
+            }
+            web.ok_or_else(|| io::Error::other("해당 파일이나 폴더를 찾을 수 없습니다."))?
+        };
+        let owner = if new_tab
+            || self
+                .secondary_browser
+                .as_ref()
+                .is_some_and(|view| view.query == window)
+        {
+            self.new_browser()?;
+            self.documents[self.active.unwrap()]
+                .browser
+                .as_ref()
+                .unwrap()
+                .query
+        } else {
+            window
+        };
+        title(owner, &url);
+        self.start_http(owner, url)
     }
 
     pub(super) fn browse_row(
@@ -1039,10 +1087,36 @@ impl App {
                     self.focus_editor();
                     self.update_status();
                 }
+                self.redraw_terminal();
                 self.report(&i18n::message("http.status", &[status.to_string()]));
             }
             Err(error) => self.report(&error.to_string()),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn simulate_http_response(&mut self, body: &str) -> io::Result<()> {
+        self.new_browser()?;
+        let view = self.documents[self.active.unwrap()]
+            .browser
+            .as_mut()
+            .unwrap();
+        let query = view.query;
+        let (sender, response) = mpsc::channel();
+        let url = "https://example.com/".to_owned();
+        assert!(
+            sender
+                .send(Ok(Response {
+                    body: body.to_owned(),
+                    status: 200,
+                    language: Language::Html,
+                    url: url.clone(),
+                }))
+                .is_ok()
+        );
+        view.request = Some((url, response));
+        self.complete_http(query);
+        Ok(())
     }
 }
 
@@ -1154,6 +1228,42 @@ fn response_language(content_type: &str, body: &str) -> Language {
             } else {
                 Language::Plain
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_hosts_default_to_https() {
+        for input in [
+            "example.com",
+            "docs.example.com:443/path?view=full#intro",
+            "www.example.com.",
+            "xn--bcher-kva.example",
+            "127.0.0.1:8443",
+        ] {
+            assert_eq!(inferred_https_url(input), Some(format!("https://{input}")));
+        }
+    }
+
+    #[test]
+    fn url_inference_ignores_paths_and_invalid_hosts() {
+        for input in [
+            r"C:\work\notes.txt",
+            r"example.com\notes.txt",
+            "./example.com",
+            "src/main.rs",
+            "notes",
+            "two words.com",
+            "example..com",
+            "example.com:65536",
+            "user@example.com",
+            "ftp://example.com",
+        ] {
+            assert_eq!(inferred_https_url(input), None, "{input}");
         }
     }
 }

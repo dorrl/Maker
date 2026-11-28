@@ -6,6 +6,7 @@ mod dock;
 mod explorer;
 mod file_actions;
 mod git;
+mod gutter;
 mod highlight;
 mod motion;
 mod preferences;
@@ -119,6 +120,10 @@ struct Paint {
     accent_brush: Handle,
     thumb: Handle,
     font: Handle,
+    gutter_font: Handle,
+    gutter_cell_width: i32,
+    gutter_width: i32,
+    gutter_height: i32,
     large_font: Handle,
     icon_font: Handle,
     editor_rgb: u32,
@@ -132,6 +137,7 @@ struct Paint {
     thumb_hover_rgb: u32,
     icons: [u32; 6],
     syntax_colors: [u32; 15],
+    diff_backgrounds: [u32; 2],
     dpi: i32,
 }
 
@@ -140,8 +146,8 @@ impl Paint {
         self.syntax_colors[crate::theme::syntax_index(color)]
     }
 
-    fn new(theme: Theme, dpi: i32) -> Self {
-        let colors = theme.palette();
+    fn new(settings: &Settings, dpi: i32, window: Handle) -> Self {
+        let colors = settings.theme.palette();
         let background = colors.get("background");
         let panel = colors.get("panel");
         let chrome = colors.get("chrome");
@@ -155,6 +161,8 @@ impl Paint {
         let foreground = colors.get("foreground");
         let muted = colors.get("muted");
         let icons = colors.icons();
+        let gutter_font = named_font(&settings.font, settings.points * dpi / 72);
+        let gutter_cell = cell_size(window, gutter_font);
         Self {
             foreground,
             muted,
@@ -169,6 +177,10 @@ impl Paint {
             accent_brush: brush(accent),
             thumb: brush(thumb),
             font: font(13 * dpi / 96),
+            gutter_font,
+            gutter_cell_width: gutter_cell.x,
+            gutter_width: gutter_cell.x * 8 + 14 * dpi / 96,
+            gutter_height: gutter_cell.y.max(1),
             large_font: font(22 * dpi / 96),
             icon_font: font(11 * dpi / 96),
             editor_rgb: background,
@@ -182,6 +194,7 @@ impl Paint {
             thumb_hover_rgb: thumb_hover,
             icons,
             syntax_colors: colors.syntax(),
+            diff_backgrounds: colors.diff_backgrounds(),
             dpi,
         }
     }
@@ -198,6 +211,7 @@ impl Paint {
             self.accent_brush,
             self.thumb,
             self.font,
+            self.gutter_font,
             self.large_font,
             self.icon_font,
         ] {
@@ -264,6 +278,7 @@ impl Document {
 }
 
 enum ListItem {
+    Draft,
     File(PathBuf, Option<usize>),
     Folder {
         path: PathBuf,
@@ -322,6 +337,8 @@ struct App {
     list: Handle,
     gutter: Handle,
     other_gutter: Handle,
+    gutter_caret: Cell<Option<(Handle, usize)>>,
+    gutter_scroll: [(Handle, isize, i32); 2],
     status: Handle,
     location: Handle,
     mode_label: Handle,
@@ -343,6 +360,7 @@ struct App {
     recently_closed: Vec<PathBuf>,
     root: Option<PathBuf>,
     files: Vec<PathBuf>,
+    files_stale: bool,
     expanded: HashSet<PathBuf>,
     explorer_selection: Option<PathBuf>,
     explorer_top: usize,
@@ -413,6 +431,14 @@ fn run_window(mut app: App, maximized: bool) -> io::Result<()> {
             0 => break,
             _ => {}
         }
+        if message.message == WM_MOUSEWHEEL
+            && matches!(
+                unsafe { GetDlgCtrlID(message.window) } as usize,
+                EDITOR | data_view::PRETTY_EDITOR | GUTTER | OTHER_GUTTER
+            )
+        {
+            merge_queued_wheel(&mut message);
+        }
         if matches!(
             message.message,
             WM_LBUTTONDOWN | WM_MBUTTONDOWN | 0x0204 | 0x00a1
@@ -427,9 +453,14 @@ fn run_window(mut app: App, maximized: bool) -> io::Result<()> {
                 {
                     app.close_menu(true);
                 }
-                if ![app.explorer.input, app.explorer.file, app.explorer.folder]
-                    .contains(&message.window)
-                    && !matches!(app.explorer.edit, Some(explorer::Edit::Rename { .. }))
+                if ![
+                    app.explorer.input,
+                    app.explorer.frame,
+                    app.explorer.file,
+                    app.explorer.folder,
+                    app.list,
+                ]
+                .contains(&message.window)
                 {
                     app.cancel_explorer_edit(false);
                 }
@@ -451,6 +482,12 @@ fn run_window(mut app: App, maximized: bool) -> io::Result<()> {
             unsafe {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
+            }
+            if matches!(message.message, WM_LBUTTONUP | WM_MBUTTONDOWN | 0x0204)
+                && with_app(|app| message.window == app.list && app.explorer_editing())
+                    .unwrap_or(false)
+            {
+                unsafe { PostMessageW(window, explorer::CANCEL_EDIT, 0, 0) };
             }
         }
     }
@@ -490,6 +527,10 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
             with_app(|app| app.finish_window_move(wp as Handle, lp != 0));
             return 0;
         }
+        dock::WINDOW_PREVIEW => {
+            with_app(|app| app.receive_tab_preview(wp, Point::packed(lp)));
+            return 0;
+        }
         browser::SEARCH_READY => {
             with_app(|app| app.complete_browser_search(wp as Handle));
             return 0;
@@ -512,10 +553,15 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
             with_app(App::git_tick);
             return 0;
         }
+        explorer::CANCEL_EDIT => {
+            with_app(|app| app.cancel_explorer_edit(false));
+            return 0;
+        }
         0x0006 if wp & 0xffff == 0 => {
             with_app(|app| app.close_menu(false));
         }
         WM_DESTROY => {
+            with_app(App::clear_dock);
             unsafe { PostQuitMessage(0) };
             return 0;
         }
@@ -575,7 +621,6 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                 motion::tick(window);
                 with_app(|app| {
                     app.finish_chrome_motion();
-                    app.refresh_sidebar_terminal_reveal();
                 });
                 return 0;
             }
@@ -583,6 +628,7 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                 COLOR_TIMER => app.repaint_editor(),
                 VIEWPORT_TIMER => app.repaint_viewport(),
                 chrome::SIDEBAR_RESIZE_TIMER => app.flush_sidebar_resize(),
+                terminal::RESIZE_TIMER => app.flush_terminal_resize(),
                 COMPLETION_TIMER => app.tick_completion(),
                 SEARCH_TIMER => app.check_search(),
                 browser::TIMER => app.start_browser_searches(),
@@ -669,12 +715,14 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                     SIDEBAR_TITLE | LIST | git::GRAPH_LIST | browser::RESULTS => {
                         (palette.panel, palette.panel_rgb, palette.foreground)
                     }
-                    git::EXPLORER_VIEW | git::CHANGES_VIEW | terminal::SIDEBAR_VIEW => {
+                    git::EXPLORER_VIEW | git::CHANGES_VIEW => {
                         (palette.chrome, palette.chrome_rgb, palette.foreground)
                     }
-                    explorer::NEW_FILE | explorer::NEW_FOLDER => {
-                        (palette.panel, palette.panel_rgb, palette.foreground)
-                    }
+                    explorer::NEW_FILE
+                    | explorer::NEW_FOLDER
+                    | git::FETCH
+                    | git::PULL
+                    | git::PUSH => (palette.panel, palette.panel_rgb, palette.foreground),
                     _ if message == WM_CTLCOLORBTN => {
                         (palette.control, palette.control_rgb, palette.foreground)
                     }
@@ -702,9 +750,10 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                     explorer::NEW_FILE | explorer::NEW_FOLDER => {
                         explorer::paint_button(item, palette)
                     }
-                    git::EXPLORER_VIEW | git::CHANGES_VIEW | terminal::SIDEBAR_VIEW => {
+                    git::EXPLORER_VIEW | git::CHANGES_VIEW => {
                         git::paint_sidebar_tab(item, palette);
                     }
+                    git::FETCH | git::PULL | git::PUSH => git::paint_remote_button(item, palette),
                     EDITOR_TOOLS => {
                         let shade = motion::value(
                             motion::Key::control(item.window, motion::Effect::Reveal),
@@ -763,6 +812,8 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                     id => {
                         let toolbar = BUTTONS.iter().any(|button| button.0 == id);
                         let mode = (data_view::FIRST_MODE..=data_view::LAST_MODE).contains(&id);
+                        let data_button = mode
+                            || (data_view::OPEN_WEB_FIRST..=data_view::OPEN_WEB_LAST).contains(&id);
                         let active = with_app(|app| {
                             if mode {
                                 app.data_mode_selected(id)
@@ -777,12 +828,10 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                             palette.control_rgb
                         };
                         let tint = chrome::button_tint(item, palette, base, active);
-                        if mode
-                            || matches!(
-                                id,
-                                browser::WORK_FOLDER | browser::OPEN_FILE | browser::RECENT_FILE
-                            )
-                        {
+                        if matches!(
+                            id,
+                            browser::WORK_FOLDER | browser::OPEN_FILE | browser::RECENT_FILE
+                        ) {
                             fill(
                                 item.dc,
                                 item.rect,
@@ -795,6 +844,16 @@ extern "system" fn window_proc(window: Handle, message: u32, wp: usize, lp: isiz
                             fill_rounded(item.dc, item.rect, (5 * palette.dpi / 96).max(1), tint);
                         } else {
                             fill_color(item.dc, item.rect, tint);
+                            if data_button {
+                                fill(
+                                    item.dc,
+                                    Rect {
+                                        right: item.rect.left + 1,
+                                        ..item.rect
+                                    },
+                                    palette.border,
+                                );
+                            }
                         }
                         draw_label(
                             item.dc,
@@ -877,6 +936,8 @@ impl App {
             )?,
             gutter: child(window, GUTTER, chrome::SURFACE, "", 0)?,
             other_gutter: child(window, OTHER_GUTTER, chrome::SURFACE, "", 0)?,
+            gutter_caret: Cell::new(None),
+            gutter_scroll: [(0, 0, 0); 2],
             status: static_label(
                 STATUS,
                 crate::i18n::text("ui.open.a.file.or.choose.a.workspace"),
@@ -908,6 +969,7 @@ impl App {
             recently_closed: Vec::new(),
             root: None,
             files: Vec::new(),
+            files_stale: false,
             expanded: HashSet::new(),
             explorer_selection: None,
             explorer_top: 0,
@@ -950,6 +1012,20 @@ impl App {
 
     fn layout_geometry(&mut self) {
         let rect = bounds(self.window);
+        batch_child_layout(self.window, || self.layout_primary_geometry(rect));
+        self.clamp_tab_scroll();
+        self.update_terminal_geometry();
+
+        // These overlays use the actual client coordinates of their anchors.
+        batch_child_layout(self.window, || {
+            self.sync_scrollbars();
+            self.layout_explorer_edit();
+            self.layout_input(rect.width(), self.px(34) + self.px(6));
+            self.position_menu();
+        });
+    }
+
+    fn layout_primary_geometry(&mut self, rect: Rect) {
         let (width, height) = (rect.width(), rect.height());
         let bar = self.px(34);
         let step = self.px(6);
@@ -1015,11 +1091,9 @@ impl App {
         let changes_bottom = self.layout_git_graph(sidebar_content, list_top);
         self.dock.sidebar_area =
             Rect::from_size(content_left, list_top, content_width, bottom - list_top);
-        self.dock.terminal_sidebar = sidebar_content;
-        let terminal_here = self.terminal_in_sidebar();
+        self.dock.terminal_sidebar = Rect::from_size(side_left, top, side, bottom - top);
         let sidebar_middle = list_top + (bottom - list_top) * self.dock.sidebar_ratio / 100;
-        let can_split_sidebar =
-            self.sidebar && !terminal_here && !self.git.open && bottom - list_top >= self.px(120);
+        let can_split_sidebar = self.sidebar && !self.git.open && bottom - list_top >= self.px(120);
         self.dock.sidebar = if can_split_sidebar {
             Rect::from_size(
                 content_left,
@@ -1050,8 +1124,8 @@ impl App {
             step,
         );
         show(self.dock.sidebar_splitter, sidebar_split);
-        show(self.sidebar_title, self.sidebar && !terminal_here);
-        show(self.list, self.sidebar && !terminal_here);
+        show(self.sidebar_title, self.sidebar);
+        show(self.list, self.sidebar);
         self.layout_explorer_buttons(Rect::from_size(content_left, top, content_width, bar));
         if self.sidebar {
             show_overlay(
@@ -1100,29 +1174,23 @@ impl App {
             show(tabs, visible);
             show(breadcrumb, visible && self.group_document(group).is_some());
         }
-        self.clamp_tab_scroll();
         self.layout_welcome(self.pane_content(0));
+        let gutter_width = PAINT.get().map_or(self.px(52), |paint| paint.gutter_width);
+        let inset = |pane: Rect| gutter_width.min(pane.width() / 2).max(0);
         for (group, gutter) in [self.gutter, self.other_gutter].into_iter().enumerate() {
             let pane = self.pane_content(group);
             let has_editor = self
                 .group_document(group)
                 .is_some_and(|i| self.documents[i].source_visible());
-            place(gutter, pane.left, pane.top, self.px(49), pane.height());
-            show(
-                gutter,
-                !self.settings.wrap && has_editor && pane.height() > 0,
-            );
+            place(gutter, pane.left, pane.top, inset(pane), pane.height());
+            show(gutter, has_editor && inset(pane) > 0 && pane.height() > 0);
         }
         for (index, document) in self.documents.iter().enumerate() {
             let visible =
                 Some(index) == self.group_document(document.group) && document.source_visible();
             if visible {
                 let pane = self.pane_content(document.group);
-                let inset = if self.settings.wrap {
-                    0
-                } else {
-                    self.px(49).min(pane.width())
-                };
+                let inset = inset(pane);
                 place(
                     document.editor,
                     pane.left + inset,
@@ -1153,10 +1221,6 @@ impl App {
         );
         show(self.status, true);
         show(self.location, true);
-        self.sync_scrollbars();
-        self.layout_explorer_edit();
-        self.layout_input(width, bar + step);
-        self.position_menu();
     }
 
     fn group_document(&self, group: usize) -> Option<usize> {
@@ -1364,7 +1428,6 @@ impl App {
             (self.explorer.folder, "ui.new.folder"),
             (self.git.explorer, "ui.explorer"),
             (self.git.changes, "ui.source.control"),
-            (self.terminal.sidebar_button, "ui.sidebar.terminal"),
         ] {
             title(handle, i18n::text(key));
         }
@@ -1403,14 +1466,14 @@ impl App {
 
     fn apply_preferences(&mut self) {
         self.terminal.font(self.dpi);
-        let paint = Paint::new(self.settings.theme, self.dpi);
+        let paint = Paint::new(&self.settings, self.dpi, self.window);
         title_theme(
             self.window,
             self.settings.dark(),
             paint.chrome_rgb,
             paint.foreground,
         );
-        send(self.list, LB_SETITEMHEIGHT, 0, self.px(24) as isize);
+        send(self.list, LB_SETITEMHEIGHT, 0, self.px(22) as isize);
         let previous = PAINT.replace(Some(paint));
         for control in self
             .git
@@ -1622,6 +1685,9 @@ impl App {
 
     fn activate(&mut self, index: usize, focus: bool) {
         let previous = self.active;
+        if previous.is_none() {
+            self.report("");
+        }
         if self.active != Some(index) {
             self.dismiss_completion();
         }
@@ -1692,6 +1758,13 @@ impl App {
         };
         let document = &self.documents[self.active.unwrap()];
         let (line, column) = caret_position(editor, self.settings.wrap);
+        let current = Some((editor, line + 1));
+        if self.gutter_caret.replace(current) != current {
+            repaint(self.gutter);
+            if self.other.is_some() {
+                repaint(self.other_gutter);
+            }
+        }
         let newline = if document.encoding.crlf { "CRLF" } else { "LF" };
         title(
             self.location,
@@ -1707,6 +1780,8 @@ impl App {
         let document = &mut self.documents[index];
         let editor = document.editor;
         if full {
+            let padding = (7 * self.dpi / 96) as isize;
+            send(editor, EM_SETMARGINS, 3, padding | padding << 16);
             send(
                 editor,
                 EM_SETBKGNDCOLOR,
@@ -1814,28 +1889,35 @@ impl App {
         }
         let palette = PAINT.get().expect("paint has been initialized");
         let base = palette.foreground;
+        let background = (document.language == Language::Diff).then_some(palette.editor_rgb);
         let range_color = hold.range_color();
-        let set_color = |start, end, color| {
+        let set_color = |start, end, color, background| {
             if !range_color
                 .as_ref()
-                .is_some_and(|target| target.set(start, end, color))
+                .is_some_and(|target| target.set(start, end, color, background))
             {
                 select(editor, start, end);
-                char_format(editor, 1, color, None);
+                char_format(editor, 1, color, background, None);
             }
         };
         if full || reset && region.is_none() {
             let font = full.then_some((self.settings.font.as_str(), self.settings.points));
-            char_format(editor, 4, base, font);
-            char_format(editor, 0, base, font);
+            char_format(editor, 4, base, background, font);
+            char_format(editor, 0, base, background, font);
         } else if reset && let Some(range) = region {
-            set_color(range.start, range.end, base);
+            set_color(range.start, range.end, base, background);
         }
         for (range, color) in runs {
+            let run_background = match color {
+                Some(Color::DiffAdded) => Some(palette.diff_backgrounds[0]),
+                Some(Color::DiffRemoved) => Some(palette.diff_backgrounds[1]),
+                _ => background,
+            };
             set_color(
                 offset + range.start,
                 offset + range.end,
                 color.map_or(base, |color| palette.highlight(color)),
+                run_background,
             );
         }
         drop(range_color);
@@ -1846,8 +1928,6 @@ impl App {
         if visible {
             painting(editor, true);
             repaint(editor);
-            repaint(self.gutter);
-            repaint(self.other_gutter);
         }
         document.highlighting = next;
         document.colored_view = region;
@@ -2058,6 +2138,7 @@ impl App {
         }
         self.root = Some(path);
         self.files = files;
+        self.files_stale = false;
         self.sidebar = true;
         self.clear_mode();
         self.request_git_refresh();
@@ -2100,25 +2181,28 @@ impl App {
         if let Some(root) = self.root.as_deref() {
             self.tree_rows(root, 0, &mut items);
         }
-        let path_for = |item: &ListItem| match item {
-            ListItem::File(path, _)
-            | ListItem::Folder { path, .. }
-            | ListItem::Archive { path, .. } => Some(path.clone()),
-            _ => None,
-        };
-        let selected = self.explorer_selection.as_ref().and_then(|selection| {
+        let selected = self.explorer_selection.as_deref().and_then(|selection| {
             items
                 .iter()
-                .position(|item| path_for(item).as_ref() == Some(selection))
+                .position(|item| explorer::row_path(item) == Some(selection))
         });
-        let choices: Vec<_> = items
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| {
-                let path = path_for(item)?;
-                self.explorer.selected.contains(&path).then_some(index)
-            })
-            .collect();
+        let choices: Vec<_> = if self.explorer.selected.is_empty() {
+            Vec::new()
+        } else {
+            let paths: HashSet<&Path> = self
+                .explorer
+                .selected
+                .iter()
+                .map(PathBuf::as_path)
+                .collect();
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| {
+                    paths.contains(explorer::row_path(item)?).then_some(index)
+                })
+                .collect()
+        };
         self.set_list(items);
         if let Some(row) = selected.or_else(|| choices.first().copied()) {
             list_select(self.list, row);
@@ -2189,11 +2273,13 @@ impl App {
     }
 
     fn set_list(&mut self, items: Vec<ListItem>) {
+        self.cancel_explorer_edit(false);
         chrome::reset_file_motion(self.list);
         painting(self.list, false);
         send(self.list, LB_RESETCONTENT, 0, 0);
         for item in &items {
             let (label, depth, icon) = match item {
+                ListItem::Draft => unreachable!("draft rows are inserted into the current tree"),
                 ListItem::File(path, depth) => {
                     let name = if depth.is_some() {
                         file_name(path)
@@ -2276,7 +2362,11 @@ impl App {
             list_entry(self.list, &label, (depth << 8) | icon);
         }
         if !items.is_empty() {
-            list_select(self.list, 0);
+            if self.is_tree() {
+                list_set_caret(self.list, 0);
+            } else {
+                list_select(self.list, 0);
+            }
         }
         self.list_items = items;
         painting(self.list, true);
@@ -2390,7 +2480,7 @@ impl App {
         };
         match item {
             ListItem::Git(change) => self.preview_git(change.clone())?,
-            ListItem::Group(_) => {}
+            ListItem::Group(_) | ListItem::Draft => {}
             ListItem::Folder { path, .. } => self.toggle_folder(row, path.clone())?,
             ListItem::Archive { path, .. } => self.archive_extract(path.clone())?,
             ListItem::ArchiveMember {
@@ -2437,6 +2527,16 @@ impl App {
         Ok(())
     }
 
+    fn refresh_file_index(&mut self) {
+        if self.files_stale
+            && let Some(root) = &self.root
+            && let Ok(files) = text::files(root)
+        {
+            self.files = files;
+            self.files_stale = false;
+        }
+    }
+
     fn start_search(&mut self) {
         let query = caption(self.query);
         if query.is_empty() {
@@ -2446,6 +2546,7 @@ impl App {
             self.report(crate::i18n::text("ui.open.a.workspace.folder.first"));
             return;
         }
+        self.refresh_file_index();
         let paths = self.files.clone();
         let dirty = self
             .documents
@@ -2625,6 +2726,7 @@ impl App {
             self.sidebar = true;
         }
         if mode == Mode::Quick {
+            self.refresh_file_index();
             self.show_files("");
         }
         if reflow {
@@ -2943,7 +3045,11 @@ impl App {
         if self.showing_issues {
             self.show_files("");
         }
-        repaint(self.gutter);
+        repaint(if self.documents[index].group == 0 {
+            self.gutter
+        } else {
+            self.other_gutter
+        });
         self.queue_session_save();
         if syntax {
             self.queue_highlight();
@@ -2998,7 +3104,9 @@ impl App {
             {
                 self.dismiss_completion();
             }
-            (EDITOR, EN_VSCROLL) => chrome::queue_scroll_sync(self.window, sender),
+            (EDITOR | data_view::PRETTY_EDITOR, EN_VSCROLL) => {
+                chrome::queue_scroll_sync(self.window, sender)
+            }
             (EDITOR, EN_SETFOCUS) => {
                 if let Some(index) = self.documents.iter().position(|doc| doc.editor == sender)
                     && self.active != Some(index)
@@ -3074,6 +3182,9 @@ impl App {
             | git::UNSTAGE
             | git::GRAPH_BRANCH
             | git::GRAPH_COMPARE
+            | git::FETCH
+            | git::PULL
+            | git::PUSH
             | git::REF_PICK_START..=git::REF_PICK_END => self.git_action(id)?,
             explorer::NEW_FILE => self.new_explorer_item(false)?,
             explorer::NEW_FOLDER => self.new_explorer_item(true)?,
@@ -3084,7 +3195,6 @@ impl App {
             | terminal::DOCK_LEFT
             | terminal::DOCK_RIGHT
             | terminal::DOCK_SIDEBAR
-            | terminal::SIDEBAR_VIEW
             | terminal::CLOSE_TAB => self.terminal_command(id)?,
             NEW => self.new_document()?,
             WELCOME_NEW => self.new_browser()?,
@@ -3132,6 +3242,7 @@ impl App {
             QUICK => self.show_mode(Mode::Quick),
             GOTO => self.show_mode(Mode::Goto),
             EXPLORER => {
+                self.cancel_explorer_edit(false);
                 self.sidebar = !self.sidebar;
                 if self.sidebar {
                     self.clear_mode();
@@ -3147,6 +3258,7 @@ impl App {
             CLOSE_FOLDER => {
                 self.root = None;
                 self.files.clear();
+                self.files_stale = false;
                 self.expanded.clear();
                 self.explorer_selection = None;
                 self.explorer.selected.clear();
@@ -3197,9 +3309,6 @@ impl App {
                         self.clear_mode();
                         self.jump_line(line.saturating_sub(1), 0);
                     }
-                }
-                Some(Mode::Rename) if self.explorer.edit.is_some() => {
-                    self.commit_explorer_edit()?
                 }
                 Some(Mode::Rename) => self.commit_symbol_rename()?,
                 None => {}
@@ -3328,7 +3437,7 @@ impl App {
                 ),
                 (
                     terminal::DOCK_SIDEBAR,
-                    crate::i18n::text("ui.open.in.sidebar"),
+                    crate::i18n::text("terminal.dock_sidebar"),
                 ),
             ],
             _ => &[],
@@ -3405,16 +3514,20 @@ impl App {
             match key {
                 13 => {
                     if let Err(error) = self.commit_explorer_edit() {
-                        self.show_error(error);
+                        self.report(&error.to_string());
                     }
                     return true;
                 }
-                0x1b => {
+                9 | 0x1b => {
                     self.cancel_explorer_edit(true);
                     return true;
                 }
-                _ => {}
+                _ => return false,
             }
+        }
+        if target == self.list && key == 0x1b && self.explorer_editing() {
+            self.cancel_explorer_edit(true);
+            return true;
         }
         if target == self.list && key == 0x71 {
             self.rename_explorer_item();
@@ -3680,11 +3793,7 @@ impl App {
             controls.push(self.dismiss);
         }
         if self.sidebar {
-            controls.extend([
-                self.git.explorer,
-                self.git.changes,
-                self.terminal.sidebar_button,
-            ]);
+            controls.extend([self.git.explorer, self.git.changes]);
             if self.git.open && self.git.has_repository() {
                 controls.extend(self.git.action_controls());
             }
@@ -3693,6 +3802,7 @@ impl App {
             }
             controls.push(self.list);
             if self.graph_visible() {
+                controls.extend(self.git.graph.remote);
                 controls.extend([
                     self.git.graph.branch,
                     self.git.graph.compare,
@@ -3724,7 +3834,9 @@ impl App {
         if self.documents.is_empty() {
             controls.extend(self.welcome_actions);
         }
-        controls.retain(|&handle| unsafe { IsWindowVisible(handle) } != 0);
+        controls.retain(|&handle| unsafe {
+            IsWindowVisible(handle) != 0 && IsWindowEnabled(handle) != 0
+        });
         if controls.is_empty() {
             return;
         }
@@ -3802,48 +3914,6 @@ impl App {
         ));
         Ok(())
     }
-
-    fn paint_gutter(&self, group: usize, dc: Handle, area: Rect, paint: Paint) {
-        let Some(index) = self.group_document(group) else {
-            return;
-        };
-        let editor = self.documents[index].editor;
-        let first = send(editor, 0x00ce, 0, 0).max(0) as usize;
-        let count = send(editor, 0x00ba, 0, 0).max(0) as usize;
-        let line_y = |line| {
-            let start = send(editor, 0x00bb, line, 0);
-            if start < 0 {
-                return None;
-            }
-            let mut point = Point::default();
-            send(editor, 0x00d6, &mut point as *mut _ as usize, start);
-            Some(point.y)
-        };
-        let mut current = line_y(first);
-        let mut height = (self.settings.points * self.dpi / 72 + self.px(4)).max(12);
-        for line in first..count.min(first + 200) {
-            let Some(top) = current.filter(|&y| y < area.bottom) else {
-                break;
-            };
-            current = line_y(line + 1);
-            if let Some(next) = current.filter(|&next| next > top) {
-                height = next - top;
-            }
-            let rect = Rect {
-                top,
-                bottom: top + height,
-                ..area
-            };
-            draw_label(
-                dc,
-                rect,
-                &(line + 1).to_string(),
-                paint.font,
-                paint.muted,
-                true,
-            );
-        }
-    }
 }
 
 fn report_error(window: Handle, error: &str) {
@@ -3878,8 +3948,8 @@ fn caret_position(editor: Handle, wrapped: bool) -> (usize, usize) {
         };
         return (line, column + 1);
     }
-    let line = send(editor, 0x00c9, index as usize, 0).max(0);
-    let start = send(editor, 0x00bb, line as usize, 0).max(0);
+    let line = send(editor, EM_EXLINEFROMCHAR, 0, index as isize).max(0);
+    let start = send(editor, EM_LINEINDEX, line as usize, 0).max(0);
     (line as usize, (index as isize - start).max(0) as usize + 1)
 }
 
@@ -4022,6 +4092,42 @@ mod tests {
         app.repaint_viewport();
         assert_eq!(app.documents[app.active.unwrap()].colored_view, Some(range));
 
+        let diff = "diff --git a/sample b/sample\n--- a/sample\n+++ b/sample\n@@ -1,2 +1,2 @@\n--- old\n+++ 새 😀\n context\n";
+        app.add_document(None, "Git diff".into(), diff, Encoding::default())?;
+        let index = app.active.unwrap();
+        let editor = app.documents[index].editor;
+        app.documents[index].language = Language::Diff;
+        send(editor, EM_SETREADONLY, 1, 0);
+        for theme in [Theme::Dark, Theme::Light] {
+            app.settings.theme = theme;
+            app.apply_preferences();
+            let paint = PAINT.get().unwrap();
+            for (prefix, foreground, background) in [
+                ("--- a/", paint.highlight(Color::Markup), paint.editor_rgb),
+                (
+                    "--- old",
+                    paint.highlight(Color::DiffRemoved),
+                    paint.diff_backgrounds[1],
+                ),
+                (
+                    "+++ 새",
+                    paint.highlight(Color::DiffAdded),
+                    paint.diff_backgrounds[0],
+                ),
+                (" context", paint.foreground, paint.editor_rgb),
+            ] {
+                let start = text::wide_offset(diff, diff.find(prefix).unwrap());
+                select(editor, start, start + prefix.encode_utf16().count() as i32);
+                assert_eq!(
+                    selection_colors(editor),
+                    (foreground, background),
+                    "{prefix}"
+                );
+            }
+        }
+        assert_eq!(editor_text(editor), diff);
+        web_preview_keeps_tabs_and_terminal(&mut app)?;
+
         unsafe {
             DestroyWindow(window);
         }
@@ -4030,6 +4136,74 @@ mod tests {
                 old.release();
             }
         });
+        Ok(())
+    }
+
+    fn web_preview_keeps_tabs_and_terminal(app: &mut App) -> io::Result<()> {
+        app.terminal.visible = true;
+        app.simulate_http_response("<!doctype html><html><body><p>Preview</p></body></html>")?;
+        let index = app.active.unwrap();
+        assert!(app.documents[index].response);
+        let terminal_header = unsafe { GetDlgItem(app.window, terminal::HEADER as i32) };
+        let terminal_body = unsafe { GetDlgItem(app.window, terminal::BODY as i32) };
+        let tabs = app.chrome.tab_handle(app.documents[index].group);
+        let chrome = [tabs, terminal_header, terminal_body];
+        let original = chrome.map(|window| relative_rect(window, app.window));
+        let assert_chrome = |app: &App| {
+            assert!(chrome.into_iter().all(is_shown));
+            assert!(
+                original
+                    .iter()
+                    .all(|rect| rect.width() > 0 && rect.height() > 0)
+            );
+            assert!(chrome.map(|window| relative_rect(window, app.window)) == original);
+        };
+
+        app.change_document_data_mode(index, data_view::ViewMode::Pretty)?;
+        assert_chrome(app);
+        let editor = app.documents[index].editor;
+        let mut pretty = None;
+        for _ in 0..100 {
+            app.complete_data_view(editor);
+            pretty = app.documents[index]
+                .data_view
+                .as_ref()
+                .and_then(data_view::View::pretty_editor);
+            if pretty.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let pretty = pretty.expect("Pretty Print finished loading the response");
+        assert!(is_shown(pretty));
+        assert!(editor_text(pretty).contains("<p>Preview</p>"));
+        assert_chrome(app);
+
+        for (kind, header) in [
+            (dock::TabKind::File, original[0]),
+            (dock::TabKind::Terminal, original[1]),
+        ] {
+            app.receive_tab_preview(
+                kind as usize,
+                Point {
+                    x: header.left,
+                    y: header.top,
+                },
+            );
+            let guide = relative_rect(app.dock.guide, app.window);
+            assert!(is_shown(app.dock.guide));
+            assert!(header.has(Point {
+                x: guide.left,
+                y: guide.top
+            }));
+            assert!(header.has(Point {
+                x: guide.right - 1,
+                y: guide.bottom - 1
+            }));
+        }
+        app.receive_tab_preview(0, Point::default());
+        assert!(!is_shown(app.dock.guide));
+        assert_chrome(app);
         Ok(())
     }
 }

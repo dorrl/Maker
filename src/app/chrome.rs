@@ -354,7 +354,6 @@ fn sidebar_button(id: usize) -> bool {
         id,
         git::EXPLORER_VIEW
             | git::CHANGES_VIEW
-            | terminal::SIDEBAR_VIEW
             | explorer::NEW_FILE
             | explorer::NEW_FOLDER
             | git::COMMIT
@@ -363,6 +362,9 @@ fn sidebar_button(id: usize) -> bool {
             | git::REFRESH
             | git::GRAPH_BRANCH
             | git::GRAPH_COMPARE
+            | git::FETCH
+            | git::PULL
+            | git::PUSH
     )
 }
 
@@ -411,8 +413,8 @@ extern "system" fn control_proc(
             return 0;
         }
     }
-    if matches!(id, EDITOR | data_view::PRETTY_EDITOR) && message == WM_MOUSEWHEEL && wp & 0x0c == 0
-    {
+    let rich_edit = matches!(id, EDITOR | data_view::PRETTY_EDITOR);
+    if rich_edit && message == WM_MOUSEWHEEL && wp & 0x0c == 0 {
         scroll_editor_wheel(window, wp);
         return 0;
     }
@@ -533,7 +535,7 @@ extern "system" fn control_proc(
     {
         post_explorer_click(parent, window, item, Point::packed(lp));
     }
-    if (id == EDITOR || list || id == git::GRAPH_LIST)
+    if (rich_edit || list || id == git::GRAPH_LIST)
         && matches!(
             message,
             WM_MOUSEWHEEL
@@ -554,10 +556,9 @@ extern "system" fn control_proc(
 }
 
 pub(super) fn post_explorer_click(parent: Handle, window: Handle, row: usize, point: Point) {
-    let data = send(window, 0x0199, row, 0) as usize;
+    let data = send(window, LB_GETITEMDATA, row, 0) as usize;
     let dpi = PAINT.get().map_or(96, |paint| paint.dpi);
-    let depth = (data >> 8).min(40) as i32;
-    let icon_left = 20 * dpi / 96 + depth * (14 * dpi / 96);
+    let icon_left = file_row_icon_left(data >> 8, bounds(window).width(), dpi);
     let flag = if point.x < icon_left { TREE_ARROW } else { 0 };
     unsafe {
         PostMessageW(parent, EXPLORER_CLICK, row, flag);
@@ -727,17 +728,30 @@ pub(super) fn vertical_thumb(target: Handle, height: i32, minimum: i32) -> Optio
 
 impl App {
     pub(super) fn sync_scrollbars(&mut self) {
-        let second = self.other.and_then(|index| {
+        let scroll_target = |index: usize| {
             let document = &self.documents[index];
-            document.source_visible().then_some(document.editor)
-        });
-        let active = self.editor();
+            if document.source_visible() {
+                Some((document.editor, !self.settings.wrap))
+            } else {
+                document
+                    .data_view
+                    .as_ref()?
+                    .pretty_editor()
+                    .map(|editor| (editor, true))
+            }
+        };
+        let active = self.active.and_then(scroll_target);
+        let second = self.other.and_then(scroll_target);
+        let vertical = |target: Option<(Handle, bool)>| target.map(|(editor, _)| editor);
+        let horizontal = |target: Option<(Handle, bool)>| {
+            target.and_then(|(editor, show)| show.then_some(editor))
+        };
         let targets = [
-            (self.sidebar && !self.terminal_in_sidebar()).then_some(self.list),
-            active,
-            active,
-            second,
-            second,
+            self.sidebar.then_some(self.list),
+            vertical(active),
+            horizontal(active),
+            vertical(second),
+            horizontal(second),
             self.graph_visible().then_some(self.git.graph.list),
         ];
         for (index, target) in targets.into_iter().enumerate() {
@@ -812,13 +826,22 @@ impl App {
                 }
             }
         }
+        if target == self.list && self.explorer_editing() {
+            self.layout_explorer_edit();
+        }
         for (group, gutter) in [self.gutter, self.other_gutter].into_iter().enumerate() {
             if self.group_document(group).is_some_and(|index| {
                 let doc = &self.documents[index];
                 doc.editor == target && doc.source_visible()
-            }) && !self.settings.wrap
-            {
-                repaint(gutter);
+            }) {
+                let mut pixel = Point::default();
+                send(target, EM_GETSCROLLPOS, 0, &mut pixel as *mut _ as isize);
+                let first = send(target, EM_GETFIRSTVISIBLELINE, 0, 0);
+                let position = (target, first, pixel.y);
+                if self.gutter_scroll[group] != position {
+                    self.gutter_scroll[group] = position;
+                    repaint(gutter);
+                }
             }
         }
         self.schedule_viewport_highlight(target);
@@ -890,6 +913,19 @@ impl App {
             GUTTER | OTHER_GUTTER => {
                 self.paint_gutter(usize::from(id == OTHER_GUTTER), dc, rect, palette)
             }
+            explorer::NAME_FRAME => {
+                fill(dc, rect, palette.accent_brush);
+                fill(
+                    dc,
+                    Rect {
+                        left: rect.left + 1,
+                        top: rect.top + 1,
+                        right: rect.right - 1,
+                        bottom: rect.bottom - 1,
+                    },
+                    palette.background,
+                );
+            }
             dock::GUIDE | dock::SPLITTER | dock::SIDEBAR_SPLITTER => {
                 self.paint_dock(id, dc, rect, palette)
             }
@@ -956,6 +992,11 @@ impl App {
         }
         match id {
             DIVIDER => self.sidebar_mouse(window, message, point),
+            GUTTER | OTHER_GUTTER if message == WM_MOUSEWHEEL => {
+                if let Some(index) = self.group_document(usize::from(id == OTHER_GUTTER)) {
+                    scroll_editor_wheel(self.documents[index].editor, wp);
+                }
+            }
             TABS | SECOND_TABS => {
                 self.tabs_mouse(usize::from(id == SECOND_TABS), message, wp, point)
             }
@@ -1490,12 +1531,9 @@ impl App {
             let moved = (point.x - origin.x).abs().max((point.y - origin.y).abs()) >= self.px(7);
             match message {
                 WM_MOUSEMOVE if moved => {
-                    if area.has(point)
-                        || self.other_tab_at(tabs, point).is_some()
-                        || self.transfer_target(tabs, point).is_some()
-                    {
+                    if area.has(point) || self.other_tab_at(tabs, point).is_some() {
                         self.clear_dock();
-                    } else {
+                    } else if !self.preview_tab_transfer(tabs, point, dock::TabKind::File) {
                         let target = self.docking_at(tabs, point, false, false);
                         self.show_dock(target);
                     }
@@ -2317,7 +2355,7 @@ pub(super) fn icon(dc: Handle, point: Point, code: usize, palette: Paint, dpi: i
         }
     } else if matches!(code, 50 | 51) {
         paint_file_mark(dc, rect, 17, palette, dpi);
-    } else if matches!(code, 3 | 10 | 15..=19) {
+    } else if matches!(code, 0 | 3 | 10 | 15..=19) {
         paint_file_mark(dc, rect, code, palette, dpi);
     } else {
         draw_label(
@@ -2347,6 +2385,18 @@ fn paint_file_mark(dc: Handle, rect: Rect, code: usize, palette: Paint, dpi: i32
     };
     let background = palette.editor_rgb;
     match code {
+        0 => {
+            for (x, y, w, h) in [
+                (4, 2, 7, 1),
+                (4, 3, 1, 13),
+                (5, 15, 9, 1),
+                (13, 5, 1, 10),
+                (10, 3, 1, 3),
+                (11, 4, 2, 2),
+            ] {
+                pixel(x, y, w, h, palette.muted);
+            }
+        }
         3 => {
             let orange = if palette.editor_rgb == rgb(24, 29, 35) {
                 rgb(249, 155, 103)
@@ -2419,6 +2469,15 @@ fn paint_file_mark(dc: Handle, rect: Rect, code: usize, palette: Paint, dpi: i32
     }
 }
 
+fn file_row_icon_left(depth: usize, width: i32, dpi: i32) -> i32 {
+    let px = |n| n * dpi / 96;
+    (px(16) + depth.min(40) as i32 * px(14)).min((width - px(72)).max(px(16)))
+}
+
+pub(super) fn file_row_label_left(depth: usize, width: i32, dpi: i32) -> i32 {
+    file_row_icon_left(depth, width, dpi) + 22 * dpi / 96
+}
+
 pub(super) fn paint_file_row(item: &DrawItem, palette: Paint, dpi: i32) {
     let selected = motion::value(
         Key::item(item.window, item.item as usize, Effect::Selected),
@@ -2430,7 +2489,7 @@ pub(super) fn paint_file_row(item: &DrawItem, palette: Paint, dpi: i32) {
         return;
     }
     let px = |n| n * dpi / 96;
-    let depth = (item.data >> 8).min(40) as i32;
+    let depth = item.data >> 8;
     let code = item.data & 255;
     if code == 14 {
         fill(item.dc, item.rect, palette.chrome);
@@ -2459,16 +2518,15 @@ pub(super) fn paint_file_row(item: &DrawItem, palette: Paint, dpi: i32) {
             motion::mix(background, palette.accent, selected),
         );
     }
-    let x = item.rect.left + px(20) + depth * px(14);
-    if depth > 0 {
-        for level in 0..depth {
-            let x = item.rect.left + px(15) + level * px(14);
-            fill(
-                item.dc,
-                Rect::from_size(x, item.rect.top, 1, item.rect.height()),
-                palette.border,
-            );
-        }
+    let x = item.rect.left + file_row_icon_left(depth, item.rect.width(), dpi);
+    let mut guide = item.rect.left + px(11);
+    while guide < x - px(5) {
+        fill(
+            item.dc,
+            Rect::from_size(guide, item.rect.top, 1, item.rect.height()),
+            palette.border,
+        );
+        guide += px(14).max(1);
     }
     let center_y = (item.rect.top + item.rect.bottom) / 2;
     let tree = folder_shape(code) || matches!(code, 50 | 51);
@@ -2498,7 +2556,7 @@ pub(super) fn paint_file_row(item: &DrawItem, palette: Paint, dpi: i32) {
     );
     let label = list_label(item.window, item.item as usize);
     let cell = Rect {
-        left: x + px(25),
+        left: item.rect.left + file_row_label_left(depth, item.rect.width(), dpi),
         right: item.rect.right - px(5),
         ..item.rect
     };
@@ -2508,11 +2566,7 @@ pub(super) fn paint_file_row(item: &DrawItem, palette: Paint, dpi: i32) {
             cell,
             &label,
             palette.font,
-            motion::mix(
-                palette.muted,
-                palette.foreground,
-                if tree { 1.0 } else { selected },
-            ),
+            palette.foreground,
             false,
         );
     }

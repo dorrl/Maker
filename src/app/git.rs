@@ -22,6 +22,9 @@ pub(super) const REFRESH: usize = 366;
 pub(super) const GRAPH_BRANCH: usize = 367;
 pub(super) const GRAPH_COMPARE: usize = 368;
 pub(super) const GRAPH_LIST: usize = 369;
+pub(super) const FETCH: usize = 411;
+pub(super) const PULL: usize = 412;
+pub(super) const PUSH: usize = 413;
 pub(super) const REF_PICK_START: usize = 2000;
 pub(super) const REF_PICK_END: usize = 2399;
 pub(super) const READY: u32 = 0x8004;
@@ -52,11 +55,45 @@ enum Operation {
     ShowCommit(String, String),
     Index { changes: Vec<Change>, stage: bool },
     Commit(String),
+    Remote(RemoteAction),
+}
+
+#[derive(Clone, Copy)]
+enum RemoteAction {
+    Fetch,
+    Pull,
+    Push,
+}
+
+impl RemoteAction {
+    const BUTTONS: [(usize, Self); 3] =
+        [(FETCH, Self::Fetch), (PULL, Self::Pull), (PUSH, Self::Push)];
+
+    fn label(self) -> &'static str {
+        i18n::text(match self {
+            Self::Fetch => "git.fetch",
+            Self::Pull => "git.pull",
+            Self::Push => "git.push",
+        })
+    }
+
+    const fn args(self) -> &'static [&'static str] {
+        match self {
+            Self::Fetch => &["fetch"],
+            Self::Pull => &["pull", "--ff-only", "--no-rebase", "--no-autostash"],
+            Self::Push => &["push"],
+        }
+    }
+}
+
+enum Completed {
+    Commit,
+    Remote(RemoteAction),
 }
 
 enum Reply {
     Empty,
-    Status(Snapshot, bool),
+    Status(Snapshot, Option<Completed>),
     Diff(Change, String),
     CommitPreview(String, String, String),
 }
@@ -65,6 +102,7 @@ struct Job {
     root: PathBuf,
     result: mpsc::Receiver<io::Result<Reply>>,
     background: bool,
+    remote: Option<RemoteAction>,
 }
 
 pub(super) struct Panel {
@@ -174,6 +212,13 @@ impl Panel {
         self.job = Some(spawn_job(window, root, known, operation)?);
         Ok(())
     }
+
+    fn refresh_remote_buttons(&self) {
+        let enabled = self.pending.is_none() && self.job.as_ref().is_none_or(|job| job.background);
+        for button in self.graph.remote {
+            enable_control(button, enabled);
+        }
+    }
 }
 
 fn spawn_job(
@@ -183,6 +228,10 @@ fn spawn_job(
     operation: Operation,
 ) -> io::Result<Job> {
     let background = matches!(operation, Operation::Status);
+    let remote = match &operation {
+        Operation::Remote(action) => Some(*action),
+        _ => None,
+    };
     let (sender, result) = mpsc::channel();
     let directory = root.clone();
     thread::Builder::new()
@@ -197,12 +246,50 @@ fn spawn_job(
         root,
         result,
         background,
+        remote,
     })
+}
+
+pub(super) fn paint_remote_button(item: &DrawItem, palette: Paint) {
+    let background = chrome::button_tint(item, palette, palette.panel_rgb, false);
+    fill_color(item.dc, item.rect, background);
+    let color = if unsafe { IsWindowEnabled(item.window) } != 0 {
+        palette.foreground
+    } else {
+        motion::mix(background, palette.muted, 0.45)
+    };
+    let p = |value: i32| (value * palette.dpi + 48 * value.signum()) / 96;
+    let x = (item.rect.left + item.rect.right) / 2;
+    let y = (item.rect.top + item.rect.bottom) / 2;
+    let line = |left, top, right, bottom| {
+        stroke_line(
+            item.dc,
+            Point {
+                x: x + p(left),
+                y: y + p(top),
+            },
+            Point {
+                x: x + p(right),
+                y: y + p(bottom),
+            },
+            color,
+        );
+    };
+    let id = item.id as usize;
+    let direction = if id == PUSH { -1 } else { 1 };
+    if id == FETCH {
+        line(0, -6, 0, -4);
+        line(0, -3, 0, 2);
+    } else {
+        line(0, -5 * direction, 0, 2 * direction);
+    }
+    line(-3, -direction, 0, 2 * direction);
+    line(0, 2 * direction, 4, -2 * direction);
+    line(-5, 5 * direction, 6, 5 * direction);
 }
 
 pub(super) fn paint_sidebar_tab(item: &DrawItem, palette: Paint) {
     let is_git = item.id as usize == CHANGES_VIEW;
-    let terminal = item.id as usize == terminal::SIDEBAR_VIEW;
     let (active_view, sidebar_right) = SIDEBAR_APPEARANCE.get();
     let active = active_view == item.id as usize;
     let p = |px| px * palette.dpi / 96;
@@ -220,21 +307,6 @@ pub(super) fn paint_sidebar_tab(item: &DrawItem, palette: Paint) {
             accent.right = accent.left + p(2);
         }
         fill_color(item.dc, accent, motion::mix(tint, palette.accent, emphasis));
-    }
-    if terminal {
-        draw_label(
-            item.dc,
-            item.rect,
-            ">_",
-            palette.font,
-            if active {
-                palette.accent
-            } else {
-                palette.muted
-            },
-            true,
-        );
-        return;
     }
     let center = (item.rect.left + item.rect.right) / 2;
     let middle = (item.rect.top + item.rect.bottom) / 2;
@@ -281,21 +353,15 @@ impl App {
     }
 
     pub(super) fn layout_sidebar_tabs(&self, area: Rect) {
-        let active = if self.terminal_in_sidebar() {
-            terminal::SIDEBAR_VIEW
-        } else if self.git.open {
+        let active = if self.git.open {
             CHANGES_VIEW
         } else {
             EXPLORER_VIEW
         };
         SIDEBAR_APPEARANCE.set((active, self.settings.sidebar_right));
-        for (index, tab) in [
-            self.git.explorer,
-            self.git.changes,
-            self.terminal.sidebar_button,
-        ]
-        .into_iter()
-        .enumerate()
+        for (index, tab) in [self.git.explorer, self.git.changes]
+            .into_iter()
+            .enumerate()
         {
             place(
                 tab,
@@ -309,7 +375,7 @@ impl App {
     }
 
     pub(super) fn layout_git_controls(&self, area: Rect, header: i32) -> i32 {
-        let show_git = self.sidebar && self.git.open && !self.terminal_in_sidebar();
+        let show_git = self.sidebar && self.git.open;
         let show_actions = show_git && self.git.snapshot.is_some();
         let gap = self.px(5);
         let margin = self.px(7);
@@ -317,7 +383,6 @@ impl App {
         let left = area.left + margin;
         let top = area.top + header;
         let width = (area.width() - margin * 2).max(0);
-        let button = self.px(44);
         place(
             self.git.refresh,
             area.right - margin - self.px(24),
@@ -326,15 +391,17 @@ impl App {
             row,
         );
         show(self.git.refresh, show_git && self.root.is_some());
-        place(self.git.message, left, top, width - button - gap, row);
-        place(self.git.commit, left + width - button, top, button, row);
-        let half = (width - gap).max(0) / 2;
-        place(self.git.stage, left, top + row + gap, half, row);
+        let stride = row + gap;
+        place(self.git.message, left, top, width, row);
+        place(self.git.commit, left, top + stride, width, row);
+        let halves = (width - gap).max(0);
+        let half = halves / 2;
+        place(self.git.stage, left, top + 2 * stride, half, row);
         place(
             self.git.unstage,
             left + half + gap,
-            top + row + gap,
-            half,
+            top + 2 * stride,
+            halves - half,
             row,
         );
         for window in [
@@ -345,17 +412,13 @@ impl App {
         ] {
             show(window, show_actions);
         }
-        top + if show_actions { 2 * (row + gap) } else { 0 }
+        top + if show_actions { 3 * stride } else { 0 }
     }
 
     pub(super) fn set_git_view(&mut self, open: bool) {
-        self.leave_sidebar_terminal();
         let previous = self.git.open;
         self.sidebar = true;
         self.git.open = open;
-        if matches!(self.mode, Some(Mode::Rename)) && self.explorer.edit.is_some() {
-            self.mode = None;
-        }
         self.cancel_explorer_edit(false);
         if matches!(self.mode, Some(Mode::Quick | Mode::Workspace)) {
             self.mode = None;
@@ -417,19 +480,30 @@ impl App {
             };
             let root = job.root.clone();
             let background = job.background;
+            let remote = job.remote;
             self.git.job = None;
             if self.root.as_ref() == Some(&root) {
                 match result {
-                    Ok(Reply::Status(snapshot, committed)) => {
+                    Ok(Reply::Status(snapshot, completed)) => {
                         let first = self.git.snapshot.is_none();
                         let changed = self.git.snapshot.as_ref() != Some(&snapshot)
                             || self.git.notice.is_some();
                         self.git.snapshot = Some(snapshot);
                         self.git.notice = None;
-                        if committed {
-                            title(self.git.message, "");
-                            self.report(crate::i18n::text("ui.committed"));
+                        if let Some(completed) = completed {
                             self.git.graph.invalidate();
+                            match completed {
+                                Completed::Commit => {
+                                    title(self.git.message, "");
+                                    self.report(i18n::text("ui.committed"));
+                                }
+                                Completed::Remote(action) => {
+                                    self.report(&i18n::message(
+                                        "git.remote_completed",
+                                        &[action.label().to_owned()],
+                                    ));
+                                }
+                            }
                         }
                         if self.git.open && changed {
                             self.show_git_items();
@@ -463,6 +537,12 @@ impl App {
                                 }
                             }
                         } else {
+                            if let Some(action) = remote {
+                                self.report(&i18n::message(
+                                    "git.remote_failed",
+                                    &[action.label().to_owned()],
+                                ));
+                            }
                             self.show_error(error);
                         }
                     }
@@ -471,15 +551,15 @@ impl App {
                 self.git.next_scan = Instant::now() + Duration::from_secs(3);
             }
         }
-        if !self.sidebar || !self.git.open || self.root.is_none() {
-            unsafe {
-                KillTimer(self.window, TIMER);
-            }
-            self.git.pending = None;
-        } else if let Some(operation) = self.git.pending.take() {
-            let root = self.root.clone().expect("opened workspace");
+        if let Some(operation) = self.git.pending.take()
+            && let Some(root) = self.root.clone()
+        {
             if let Err(error) = self.git.start(self.window, root, operation) {
                 self.show_error(error);
+            }
+        } else if !self.sidebar || !self.git.open || self.root.is_none() {
+            unsafe {
+                KillTimer(self.window, TIMER);
             }
         } else if Instant::now() >= self.git.next_scan && self.git.job.is_none() {
             let root = self.root.clone().expect("opened workspace");
@@ -488,6 +568,7 @@ impl App {
             }
             self.git.next_scan = Instant::now() + Duration::from_secs(3);
         }
+        self.git.refresh_remote_buttons();
         self.check_git_graph();
     }
 
@@ -574,6 +655,21 @@ impl App {
             GRAPH_BRANCH | GRAPH_COMPARE => self.choose_graph_ref(id),
             REF_PICK_START..=REF_PICK_END => self.select_graph_ref(id - REF_PICK_START),
             REFRESH => self.request_git_refresh(),
+            FETCH | PULL | PUSH => {
+                if self.git.has_repository()
+                    && self.git.pending.is_none()
+                    && self.git.job.as_ref().is_none_or(|job| job.background)
+                    && let Some((_, action)) = RemoteAction::BUTTONS
+                        .into_iter()
+                        .find(|&(button, _)| button == id)
+                {
+                    self.start_git_action(Operation::Remote(action))?;
+                    self.report(&i18n::message(
+                        "git.remote_running",
+                        &[action.label().to_owned()],
+                    ));
+                }
+            }
             STAGE | UNSTAGE => {
                 let stage = id == STAGE;
                 let changes: Vec<_> = list_selection(self.list)
@@ -699,6 +795,7 @@ impl App {
         unsafe {
             SetTimer(self.window, TIMER, 400, 0);
         }
+        self.git.refresh_remote_buttons();
         Ok(())
     }
 
@@ -772,7 +869,7 @@ fn run(workspace: &Path, known: Option<&Path>, operation: Operation) -> io::Resu
 
 fn run_at(program: &Path, root: &Path, operation: Operation) -> io::Result<Reply> {
     match operation {
-        Operation::Status => Ok(Reply::Status(status(program, root)?, false)),
+        Operation::Status => Ok(Reply::Status(status(program, root)?, None)),
         Operation::Diff(change) => {
             let mut diff = command(program, root);
             diff.args(["diff", "--no-ext-diff", "--no-textconv", "--no-color"]);
@@ -817,7 +914,7 @@ fn run_at(program: &Path, root: &Path, operation: Operation) -> io::Result<Reply
             if !output.status.success() {
                 return Err(command_error(&output));
             }
-            Ok(Reply::Status(status(program, root)?, false))
+            Ok(Reply::Status(status(program, root)?, None))
         }
         Operation::Commit(message) => {
             let output = command(program, root)
@@ -826,7 +923,20 @@ fn run_at(program: &Path, root: &Path, operation: Operation) -> io::Result<Reply
             if !output.status.success() {
                 return Err(command_error(&output));
             }
-            Ok(Reply::Status(status(program, root)?, true))
+            Ok(Reply::Status(
+                status(program, root)?,
+                Some(Completed::Commit),
+            ))
+        }
+        Operation::Remote(action) => {
+            let output = command(program, root).args(action.args()).output()?;
+            if !output.status.success() {
+                return Err(command_error(&output));
+            }
+            Ok(Reply::Status(
+                status(program, root)?,
+                Some(Completed::Remote(action)),
+            ))
         }
         Operation::ShowCommit(id, subject) => {
             let mut git = command(program, root);

@@ -1,7 +1,9 @@
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     ffi::{OsStr, OsString, c_void},
     io,
-    mem::size_of,
+    mem::{size_of, zeroed},
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::PathBuf,
     ptr::{null, null_mut},
@@ -75,6 +77,13 @@ pub const EM_GETMODIFY: u32 = 0x00b8;
 pub const EM_SCROLLCARET: u32 = 0x00b7;
 pub const EM_SCROLL: u32 = 0x00b5;
 pub const EM_LINESCROLL: u32 = 0x00b6;
+pub const EM_GETRECT: u32 = 0x00b2;
+pub const EM_GETLINECOUNT: u32 = 0x00ba;
+pub const EM_LINEINDEX: u32 = 0x00bb;
+pub const EM_GETFIRSTVISIBLELINE: u32 = 0x00ce;
+pub const EM_POSFROMCHAR: u32 = 0x00d6;
+pub const EM_SETMARGINS: u32 = 0x00d3;
+pub const EM_EXLINEFROMCHAR: u32 = 0x0400 + 54;
 pub const EM_EMPTYUNDOBUFFER: u32 = 0x00cd;
 pub const EM_REDO: u32 = 0x0400 + 84;
 pub const EM_UNDO: u32 = 0x00c7;
@@ -95,12 +104,15 @@ pub const ENM_SCROLL: isize = 4;
 pub const ENM_SELCHANGE: isize = 0x00080000;
 pub const LB_RESETCONTENT: u32 = 0x0184;
 pub const LB_ADDSTRING: u32 = 0x0180;
+const LB_INSERTSTRING: u32 = 0x0181;
+pub const LB_DELETESTRING: u32 = 0x0182;
 pub const LB_GETCOUNT: u32 = 0x018b;
 pub const LB_GETTOPINDEX: u32 = 0x018e;
 pub const LB_SETTOPINDEX: u32 = 0x0197;
 pub const LB_SETITEMHEIGHT: u32 = 0x01a0;
 pub const LB_GETITEMHEIGHT: u32 = 0x01a1;
 pub const LB_SETITEMDATA: u32 = 0x019a;
+pub const LB_GETITEMDATA: u32 = 0x0199;
 const LB_SETSEL: u32 = 0x0185;
 const LB_GETSELCOUNT: u32 = 0x0190;
 const LB_GETSELITEMS: u32 = 0x0191;
@@ -115,6 +127,12 @@ pub const EM_SETREADONLY: u32 = 0x00cf;
 const SWP_NOACTIVATE: u32 = 0x0010;
 const SWP_NOCOPYBITS: u32 = 0x0100;
 const SWP_DEFERERASE: u32 = 0x2000;
+const SWP_NOSIZE: u32 = 1;
+const SWP_NOMOVE: u32 = 2;
+const SWP_NOZORDER: u32 = 4;
+const SWP_SHOWWINDOW: u32 = 0x0040;
+const SWP_HIDEWINDOW: u32 = 0x0080;
+const WS_EX_COMPOSITED: u32 = 0x02000000;
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -180,6 +198,18 @@ pub struct Notify {
     pub window: Handle,
     pub id: usize,
     pub code: u32,
+}
+
+#[repr(C)]
+struct ToolInfo {
+    size: u32,
+    flags: u32,
+    owner: Handle,
+    tool: usize,
+    rect: Rect,
+    instance: Handle,
+    text: *const u16,
+    data: isize,
 }
 
 #[repr(C)]
@@ -261,6 +291,17 @@ struct CharFormat {
     charset: u8,
     family: u8,
     face: [u16; 32],
+    weight: u16,
+    spacing: i16,
+    background: u32,
+    locale: u32,
+    cookie: u32,
+    style: i16,
+    kerning: u16,
+    underline_type: u8,
+    animation: u8,
+    revision_author: u8,
+    underline_color: u8,
 }
 
 #[repr(C)]
@@ -310,7 +351,9 @@ struct TomFontVtable {
     query: usize,
     add_ref: usize,
     release: unsafe extern "system" fn(*mut TomFont) -> u32,
-    before_foreground: [usize; 22],
+    before_background: [usize; 16],
+    set_background: unsafe extern "system" fn(*mut TomFont, i32) -> i32,
+    before_foreground: [usize; 5],
     set_foreground: unsafe extern "system" fn(*mut TomFont, i32) -> i32,
 }
 
@@ -320,10 +363,13 @@ pub struct RangeColor {
 }
 
 impl RangeColor {
-    pub fn set(&self, start: i32, end: i32, color: u32) -> bool {
+    pub fn set(&self, start: i32, end: i32, color: u32, background: Option<u32>) -> bool {
         unsafe {
+            let font = &*(*self.font).vtable;
             ((*(*self.range).vtable).set_range)(self.range, start, end) >= 0
-                && ((*(*self.font).vtable).set_foreground)(self.font, color as i32) >= 0
+                && (font.set_foreground)(self.font, color as i32) >= 0
+                && background
+                    .is_none_or(|color| (font.set_background)(self.font, color as i32) >= 0)
         }
     }
 }
@@ -554,6 +600,7 @@ unsafe extern "system" {
     pub fn DestroyWindow(window: Handle) -> i32;
     pub fn PostQuitMessage(exit: i32);
     pub fn GetMessageW(message: *mut Msg, window: Handle, min: u32, max: u32) -> i32;
+    fn PeekMessageW(message: *mut Msg, window: Handle, min: u32, max: u32, remove: u32) -> i32;
     pub fn TranslateMessage(message: *const Msg) -> i32;
     pub fn DispatchMessageW(message: *const Msg) -> isize;
     fn SendMessageW(window: Handle, message: u32, wp: usize, lp: isize) -> isize;
@@ -586,6 +633,8 @@ unsafe extern "system" {
     fn GetNextDlgTabItem(window: Handle, control: Handle, previous: i32) -> Handle;
     pub fn GetDlgItem(window: Handle, id: i32) -> Handle;
     pub fn GetDlgCtrlID(window: Handle) -> i32;
+    fn EnableWindow(window: Handle, enabled: i32) -> i32;
+    pub fn IsWindowEnabled(window: Handle) -> i32;
     pub fn GetParent(window: Handle) -> Handle;
     pub fn SetCapture(window: Handle) -> Handle;
     pub fn ReleaseCapture() -> i32;
@@ -621,6 +670,18 @@ unsafe extern "system" {
         cy: i32,
         flags: u32,
     ) -> i32;
+    fn BeginDeferWindowPos(count: i32) -> Handle;
+    fn DeferWindowPos(
+        batch: Handle,
+        window: Handle,
+        after: Handle,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        flags: u32,
+    ) -> Handle;
+    fn EndDeferWindowPos(batch: Handle) -> i32;
     fn SetWindowRgn(window: Handle, region: Handle, redraw: i32) -> i32;
 }
 
@@ -803,7 +864,7 @@ pub fn main_window(class: &str) -> io::Result<Handle> {
     let (class, title) = (wide(class), wide("Maker"));
     let handle = unsafe {
         CreateWindowExW(
-            0,
+            WS_EX_COMPOSITED,
             class.as_ptr(),
             title.as_ptr(),
             0x02cf0000,
@@ -905,11 +966,69 @@ pub fn send(window: Handle, message: u32, wp: usize, lp: isize) -> isize {
     unsafe { SendMessageW(window, message, wp, lp) }
 }
 pub fn show(window: Handle, visible: bool) {
+    if defer_child(window, None, Some(visible), false) {
+        return;
+    }
     unsafe {
-        let shown = GetWindowLongW(window, -16) as u32 & 0x10000000 != 0;
-        if shown != visible {
+        if is_shown(window) != visible {
             ShowWindow(window, if visible { 8 } else { 0 });
         }
+    }
+}
+
+pub fn is_shown(window: Handle) -> bool {
+    unsafe { GetWindowLongW(window, -16) as u32 & 0x10000000 != 0 }
+}
+
+pub fn enable_control(window: Handle, enabled: bool) {
+    if (unsafe { IsWindowEnabled(window) } != 0) != enabled {
+        unsafe { EnableWindow(window, i32::from(enabled)) };
+        repaint(window);
+    }
+}
+
+pub fn tooltip_window(owner: Handle) -> Handle {
+    let class = wide("tooltips_class32");
+    unsafe {
+        CreateWindowExW(
+            8, // WS_EX_TOPMOST
+            class.as_ptr(),
+            null(),
+            0x80000003, // WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX
+            0,
+            0,
+            0,
+            0,
+            owner,
+            0,
+            GetModuleHandleW(null()),
+            null(),
+        )
+    }
+}
+
+pub fn tooltip_label(tooltip: Handle, control: Handle, label: &[u16], update: bool) {
+    if tooltip == 0 {
+        return;
+    }
+    let info = ToolInfo {
+        size: size_of::<ToolInfo>() as u32,
+        flags: 0x11, // TTF_IDISHWND | TTF_SUBCLASS
+        owner: unsafe { GetParent(control) },
+        tool: control as usize,
+        rect: Rect::default(),
+        instance: 0,
+        text: label.as_ptr(),
+        data: 0,
+    };
+    let message = if update { 0x0439 } else { 0x0432 };
+    send(tooltip, message, 0, &info as *const _ as isize);
+}
+
+pub fn tooltip_colors(tooltip: Handle, background: u32, foreground: u32) {
+    if tooltip != 0 {
+        send(tooltip, 0x0413, background as usize, 0);
+        send(tooltip, 0x0414, foreground as usize, 0);
     }
 }
 
@@ -1021,6 +1140,9 @@ pub fn show_main_window(window: Handle, maximized: bool) {
 }
 
 pub fn show_overlay(window: Handle, rect: Rect) {
+    if defer_child(window, Some(rect), Some(true), true) {
+        return;
+    }
     unsafe {
         let flags = if relative_rect(window, GetParent(window)) == rect {
             0x0053
@@ -1036,6 +1158,127 @@ pub fn show_overlay(window: Handle, rect: Rect) {
             rect.height(),
             flags,
         );
+    }
+}
+
+#[derive(Default)]
+struct ChildPlacement {
+    window: Handle,
+    rect: Option<Rect>,
+    visible: Option<bool>,
+    raise: bool,
+}
+
+struct ChildLayout {
+    parent: Handle,
+    indices: HashMap<Handle, usize>,
+    placements: Vec<ChildPlacement>,
+}
+
+thread_local! {
+    static CHILD_LAYOUT: RefCell<Option<ChildLayout>> = const { RefCell::new(None) };
+}
+
+fn defer_child(window: Handle, rect: Option<Rect>, visible: Option<bool>, raise: bool) -> bool {
+    CHILD_LAYOUT.with_borrow_mut(|slot| {
+        let Some(layout) = slot.as_mut() else {
+            return false;
+        };
+        if window == 0 || unsafe { GetParent(window) } != layout.parent {
+            return false;
+        }
+        let index = *layout.indices.entry(window).or_insert_with(|| {
+            layout.placements.push(ChildPlacement {
+                window,
+                ..ChildPlacement::default()
+            });
+            layout.placements.len() - 1
+        });
+        let placement = &mut layout.placements[index];
+        placement.rect = rect.or(placement.rect);
+        placement.visible = visible.or(placement.visible);
+        placement.raise |= raise;
+        true
+    })
+}
+
+pub fn batch_child_layout(parent: Handle, layout: impl FnOnce()) {
+    CHILD_LAYOUT.with_borrow_mut(|slot| {
+        assert!(slot.is_none());
+        *slot = Some(ChildLayout {
+            parent,
+            indices: HashMap::new(),
+            placements: Vec::new(),
+        });
+    });
+    layout();
+    let placements = CHILD_LAYOUT.with_borrow_mut(|slot| slot.take().unwrap().placements);
+    let changed: Vec<_> = placements
+        .into_iter()
+        .filter_map(|placement| {
+            let window = placement.window;
+            let mut flags = SWP_NOACTIVATE | SWP_DEFERERASE;
+            let rect = placement
+                .rect
+                .filter(|rect| *rect != relative_rect(window, parent));
+            if rect.is_none() {
+                flags |= SWP_NOSIZE | SWP_NOMOVE;
+            } else {
+                flags |= SWP_NOCOPYBITS;
+            }
+            let visible = placement
+                .visible
+                .filter(|&visible| visible != is_shown(window));
+            if let Some(visible) = visible {
+                flags |= if visible {
+                    SWP_SHOWWINDOW
+                } else {
+                    SWP_HIDEWINDOW
+                };
+            }
+            if !placement.raise {
+                flags |= SWP_NOZORDER;
+            }
+            (rect.is_some() || visible.is_some() || placement.raise).then_some((
+                window,
+                rect.unwrap_or_default(),
+                flags,
+            ))
+        })
+        .collect();
+    if changed.is_empty() {
+        return;
+    }
+    unsafe {
+        let mut batch = BeginDeferWindowPos(changed.len() as i32);
+        for &(window, rect, flags) in &changed {
+            if batch == 0 {
+                break;
+            }
+            batch = DeferWindowPos(
+                batch,
+                window,
+                0,
+                rect.left,
+                rect.top,
+                rect.width(),
+                rect.height(),
+                flags,
+            );
+        }
+        if batch == 0 || EndDeferWindowPos(batch) == 0 {
+            for (window, rect, flags) in changed {
+                SetWindowPos(
+                    window,
+                    0,
+                    rect.left,
+                    rect.top,
+                    rect.width(),
+                    rect.height(),
+                    flags,
+                );
+            }
+        }
     }
 }
 
@@ -1098,10 +1341,6 @@ pub fn clear_clip(window: Handle) {
     unsafe {
         SetWindowRgn(window, 0, 1);
     }
-}
-
-pub fn paint(window: Handle, draw: impl FnOnce(Handle, Rect)) {
-    paint_region(window, |dc, bounds, _| draw(dc, bounds));
 }
 
 pub fn combo_info(window: Handle) -> ComboBoxInfo {
@@ -1271,6 +1510,9 @@ pub fn title_theme(window: Handle, dark: bool, background: u32, foreground: u32)
 }
 pub fn place(window: Handle, x: i32, y: i32, width: i32, height: i32) {
     let area = Rect::from_size(x, y, width.max(0), height.max(0));
+    if defer_child(window, Some(area), None, false) {
+        return;
+    }
     unsafe {
         if relative_rect(window, GetParent(window)) != area {
             SetWindowPos(
@@ -1324,23 +1566,66 @@ pub fn wheel_scroll_lines() -> u32 {
     lines
 }
 
+pub fn merge_queued_wheel(message: &mut Msg) {
+    let flags = message.wparam & 0xffff;
+    let mut delta = (message.wparam >> 16) as i16;
+    if delta == 0 || flags & 0x0c != 0 {
+        return;
+    }
+    let mut next: Msg = unsafe { std::mem::zeroed() };
+    // Only combine adjacent input to the same control without crossing another action.
+    for _ in 0..15 {
+        if unsafe { PeekMessageW(&mut next, 0, 0, 0, 0) } == 0
+            || next.window != message.window
+            || next.message != WM_MOUSEWHEEL
+            || next.wparam & 0xffff != flags
+        {
+            break;
+        }
+        let movement = (next.wparam >> 16) as i16;
+        let Some(total) = delta
+            .checked_add(movement)
+            .filter(|_| delta.signum() == movement.signum())
+        else {
+            break;
+        };
+        if unsafe { PeekMessageW(&mut next, message.window, WM_MOUSEWHEEL, WM_MOUSEWHEEL, 1) } == 0
+        {
+            break;
+        }
+        delta = total;
+    }
+    message.wparam = flags | ((delta as u16 as usize) << 16);
+}
+
 pub fn editor_character_at(window: Handle, point: Point) -> i32 {
     send(window, 0x00d7, 0, &point as *const _ as isize).max(0) as i32
 }
 
-pub fn editor_range(window: Handle, start: i32, end: i32) -> String {
-    #[repr(C)]
-    struct TextRange {
-        range: Selection,
-        output: *mut u16,
-    }
-    let mut buffer = vec![0u16; (end - start).max(0) as usize + 1];
+#[repr(C)]
+struct TextRange {
+    range: Selection,
+    output: *mut u16,
+}
+
+fn read_editor_range(window: Handle, start: i32, end: i32, buffer: &mut [u16]) -> usize {
     let range = TextRange {
         range: Selection { start, end },
         output: buffer.as_mut_ptr(),
     };
-    let read = send(window, 0x0400 + 75, 0, &range as *const _ as isize).max(0) as usize;
+    send(window, 0x0400 + 75, 0, &range as *const _ as isize).max(0) as usize
+}
+
+pub fn editor_range(window: Handle, start: i32, end: i32) -> String {
+    let mut buffer = vec![0u16; (end - start).max(0) as usize + 1];
+    let read = read_editor_range(window, start, end, &mut buffer);
     String::from_utf16_lossy(&buffer[..read.min(buffer.len() - 1)]).replace('\r', "\n")
+}
+
+pub fn editor_line_break_before(window: Handle, position: i32) -> bool {
+    let mut buffer = [0u16; 4];
+    read_editor_range(window, position - 1, position, &mut buffer) > 0
+        && matches!(buffer[0], 10..=13 | 0x2029)
 }
 
 pub fn move_path(source: &std::path::Path, target: &std::path::Path) -> io::Result<()> {
@@ -1736,18 +2021,37 @@ pub fn copy_text(window: Handle, text: &str) {
 pub fn set_font(window: Handle, font: Handle) {
     send(window, 0x0030, font as usize, 1);
 }
-pub fn draw_label(dc: Handle, mut rect: Rect, text: &str, font: Handle, color: u32, center: bool) {
+pub fn draw_label(dc: Handle, rect: Rect, text: &str, font: Handle, color: u32, center: bool) {
     let text = wide(text);
     let flags = 0x0004 | 0x0020 | 0x0800 | 0x8000 | if center { 1 } else { 0 };
+    draw_wide_label(dc, rect, &text[..text.len() - 1], font, color, flags);
+}
+
+fn draw_wide_label(dc: Handle, mut rect: Rect, text: &[u16], font: Handle, color: u32, flags: u32) {
     unsafe {
         let before = SelectObject(dc, font);
         SetBkMode(dc, 1);
         SetTextColor(dc, color);
-        DrawTextW(dc, text.as_ptr(), text.len() as i32 - 1, &mut rect, flags);
+        DrawTextW(dc, text.as_ptr(), text.len() as i32, &mut rect, flags);
         if before != 0 {
             SelectObject(dc, before);
         }
     }
+}
+
+pub fn draw_line_number(dc: Handle, rect: Rect, mut number: usize, font: Handle, color: u32) {
+    let mut digits = [0u16; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' as u16 + (number % 10) as u16;
+        number /= 10;
+        if number == 0 {
+            break;
+        }
+    }
+    // DT_RIGHT | DT_VCENTER | DT_SINGLELINE
+    draw_wide_label(dc, rect, &digits[start..], font, color, 0x26);
 }
 pub fn list_entry(list: Handle, label: &str, data: usize) {
     let label = wide(label);
@@ -1755,6 +2059,16 @@ pub fn list_entry(list: Handle, label: &str, data: usize) {
     if index >= 0 {
         send(list, LB_SETITEMDATA, index as usize, data as isize);
     }
+}
+
+pub fn insert_list_entry(list: Handle, row: usize, data: usize) -> io::Result<()> {
+    let empty = [0u16];
+    let index = send(list, LB_INSERTSTRING, row, empty.as_ptr() as isize);
+    if index < 0 {
+        return Err(io::Error::from(io::ErrorKind::OutOfMemory));
+    }
+    send(list, LB_SETITEMDATA, index as usize, data as isize);
+    Ok(())
 }
 
 pub fn list_label(list: Handle, index: usize) -> String {
@@ -2094,18 +2408,22 @@ pub fn replace_selection(window: Handle, value: &str) {
     send(window, 0x00c2, 1, value.as_ptr() as isize);
 }
 
-pub fn char_format(window: Handle, scope: usize, color: u32, font: Option<(&str, i32)>) {
-    let mut spec = CharFormat {
-        size: size_of::<CharFormat>() as u32,
-        mask: 0x40000000,
-        effects: 0,
-        height: 0,
-        offset: 0,
-        color,
-        charset: 1,
-        family: 0,
-        face: [0; 32],
-    };
+pub fn char_format(
+    window: Handle,
+    scope: usize,
+    color: u32,
+    background: Option<u32>,
+    font: Option<(&str, i32)>,
+) {
+    let mut spec: CharFormat = unsafe { zeroed() };
+    spec.size = size_of::<CharFormat>() as u32;
+    spec.mask = 0x40000000;
+    spec.color = color;
+    spec.charset = 1;
+    if let Some(background) = background {
+        spec.mask |= 0x04000000; // CFM_BACKCOLOR
+        spec.background = background;
+    }
     if let Some((name, points)) = font {
         spec.mask |= 0xa0000000;
         spec.height = points * 20;
@@ -2123,10 +2441,15 @@ pub fn char_format(window: Handle, scope: usize, color: u32, font: Option<(&str,
 
 #[cfg(test)]
 pub fn selection_foreground(window: Handle) -> u32 {
-    let mut format: CharFormat = unsafe { std::mem::zeroed() };
+    selection_colors(window).0
+}
+
+#[cfg(test)]
+pub fn selection_colors(window: Handle) -> (u32, u32) {
+    let mut format: CharFormat = unsafe { zeroed() };
     format.size = size_of::<CharFormat>() as u32;
     send(window, 0x0400 + 58, 1, &mut format as *mut _ as isize);
-    format.color
+    (format.color, format.background)
 }
 
 fn text_document(window: Handle) -> Option<*mut TextDocument> {
@@ -2171,11 +2494,16 @@ pub fn editor_paragraph(window: Handle, position: i32) -> Option<(usize, i32)> {
         let table = &*(*range).vtable;
         let mut index = 0;
         let mut start = 0;
-        let ok = (table.get_index)(range, TOM_PARAGRAPH, &mut index) == 0
-            && index > 0
-            && (table.set_index)(range, TOM_PARAGRAPH, index, TOM_MOVE) == 0
-            && (table.get_start)(range, &mut start) == 0
-            && start <= position;
+        let ok = (table.get_index)(range, TOM_PARAGRAPH, &mut index) == 0 && index > 0 && {
+            let moved = (table.set_index)(range, TOM_PARAGRAPH, index, TOM_MOVE);
+            // Rich Edit returns S_FALSE when the range is already at the paragraph start.
+            (table.get_start)(range, &mut start) == 0
+                && start <= position
+                && (moved == 0
+                    || moved == 1
+                        && start == position
+                        && (start == 0 || editor_line_break_before(window, start)))
+        };
         (table.release)(range);
         ok.then(|| (index as usize - 1, start))
     }

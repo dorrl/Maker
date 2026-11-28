@@ -150,14 +150,36 @@ impl Palette {
 
     pub fn syntax(&self) -> [u32; 15] {
         SYNTAX.map(|key| {
-            self.overrides
-                .as_ref()
-                .and_then(|value| value.get("syntax"))
-                .and_then(|colors| colors.get(key))
-                .and_then(color)
+            let diff_key = match key {
+                "diff_added" => Some("added_text"),
+                "diff_removed" => Some("removed_text"),
+                _ => None,
+            };
+            if let Some(diff_key) = diff_key {
+                return self
+                    .override_color("diff", diff_key)
+                    .or_else(|| self.override_color("syntax", key))
+                    .unwrap_or_else(|| self.built_in_diff(diff_key));
+            }
+            self.override_color("syntax", key)
                 .or_else(|| self.built_in["syntax"].get(key).and_then(color))
                 .expect("built-in syntax color")
         })
+    }
+
+    pub fn diff_backgrounds(&self) -> [u32; 2] {
+        ["added_background", "removed_background"].map(|key| {
+            self.override_color("diff", key)
+                .unwrap_or_else(|| self.built_in_diff(key))
+        })
+    }
+
+    fn override_color(&self, section: &str, key: &str) -> Option<u32> {
+        color(self.overrides.as_ref()?.get(section)?.get(key)?)
+    }
+
+    fn built_in_diff(&self, key: &str) -> u32 {
+        color(&self.built_in["diff"][key]).expect("built-in diff color")
     }
 
     pub fn icons(&self) -> [u32; 6] {
@@ -201,6 +223,9 @@ mod tests {
             }
             assert_eq!(palette.icons().len(), 6);
             assert_eq!(palette.syntax().len(), 15);
+            for background in palette.diff_backgrounds() {
+                assert_ne!(background, palette.get("background"));
+            }
         }
     }
 }
